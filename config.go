@@ -109,6 +109,9 @@ func (c *Config) validate() ([]string, error) {
 		if !strings.HasPrefix(r.Path, "/") || strings.ContainsAny(r.Path, "?#\r\n") {
 			return nil, fmt.Errorf("%s.path must be an absolute URL path without query or fragment", label)
 		}
+		if ambiguousPath(&url.URL{Path: r.Path}) {
+			return nil, fmt.Errorf("%s.path contains ambiguous separators or dot segments", label)
+		}
 		r.Path = strings.TrimRight(r.Path, "/")
 		if r.Path == "" {
 			r.Path = "/"

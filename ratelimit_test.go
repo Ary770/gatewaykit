@@ -88,3 +88,21 @@ func TestRateLimitCapacityAndCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestSlidingWindowReorderedConcurrentTimestamps(t *testing.T) {
+	l := newRateLimiter(&RateLimitConfig{Requests: 2, Window: "10s", Strategy: "sliding_window", Per: "global"})
+	start := time.Unix(100, 0)
+	// The earlier caller can acquire the mutex after the later caller.
+	if ok, _, _ := l.allow("a", start.Add(9*time.Second)); !ok {
+		t.Fatal("first request rejected")
+	}
+	if ok, _, _ := l.allow("b", start.Add(time.Second)); !ok {
+		t.Fatal("delayed request rejected")
+	}
+	if ok, _, _ := l.allow("c", start.Add(11*time.Second)); ok {
+		t.Fatal("reordered timestamps prematurely expired live requests")
+	}
+	if ok, _, _ := l.allow("d", start.Add(19*time.Second)); !ok {
+		t.Fatal("requests did not expire at their effective evaluation time")
+	}
+}

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -45,7 +48,7 @@ func TestProxyPreservesRequestAndResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 	g := testGateway(t, RouteConfig{Path: "/api/users", Methods: []string{"POST"}, Upstream: UpstreamConfig{URL: upstream.URL + "/base?fixed=1"}})
-	req := httptest.NewRequest("POST", "http://gateway/api/users/a%2Fb?q=a%20b&q=c", strings.NewReader(`{"name":"Ada"}`))
+	req := httptest.NewRequest("POST", "http://gateway/api/users/a%20b?q=a%20b&q=c", strings.NewReader(`{"name":"Ada"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Connection", "X-Secret")
 	req.Header.Set("X-Secret", "remove")
@@ -53,8 +56,13 @@ func TestProxyPreservesRequestAndResponse(t *testing.T) {
 	req.RemoteAddr = "192.0.2.25:1234"
 	result := httptest.NewRecorder()
 	g.ServeHTTP(result, req)
-	got := <-received
-	if got.method != "POST" || got.uri != "/base/api/users/a%2Fb?fixed=1&q=a%20b&q=c" || got.body != `{"name":"Ada"}` {
+	var got observed
+	select {
+	case got = <-received:
+	case <-time.After(time.Second):
+		t.Fatalf("upstream was not reached; response=%d %s", result.Code, result.Body.String())
+	}
+	if got.method != "POST" || got.uri != "/base/api/users/a%20b?fixed=1&q=a%20b&q=c" || got.body != `{"name":"Ada"}` {
 		t.Fatalf("upstream request: %+v", got)
 	}
 	target, _ := url.Parse(upstream.URL)
@@ -83,7 +91,7 @@ func TestRoutingAndStripping(t *testing.T) {
 		{"GET", "/api/products/123?q=1", 200, "/123?q=1"},
 		{"GET", "/api/products", 200, "/"},
 		{"GET", "/api/products/", 200, "/"},
-		{"GET", "/api/products/a%2Fb", 200, "/a%2Fb"},
+		{"GET", "/api/products/a%20b", 200, "/a%20b"},
 		{"GET", "/api/users", 200, "/api/users"},
 		{"GET", "/api/productsXYZ", 200, "/api/productsXYZ"},
 		{"GET", "/apiXYZ", 404, ""},
@@ -288,5 +296,141 @@ func TestRateLimitCapacityHTTPResponse(t *testing.T) {
 	g.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
 	if w.Code != 503 || w.Header().Get("Retry-After") != "1" {
 		t.Fatalf("got %d headers=%v", w.Code, w.Header())
+	}
+}
+
+func TestEncodedPathsCannotBypassAuthentication(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); _, _ = io.WriteString(w, r.RequestURI) }))
+	defer upstream.Close()
+	g := testGateway(t,
+		RouteConfig{Path: "/api", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}},
+		RouteConfig{Path: "/api/internal", Methods: []string{"GET"}, StripPrefix: true, Upstream: UpstreamConfig{URL: upstream.URL}, Auth: &AuthConfig{Type: "api_key", Header: "X-Key", Keys: []string{"secret"}}},
+	)
+	for _, path := range []string{"/api/internal", "/api/%69nternal", "/%61pi/internal"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 401 {
+			t.Fatalf("%s bypassed policy: %d", path, w.Code)
+		}
+	}
+	for _, path := range []string{"/api%2finternal", "/api/public/../internal", "/api/public/%2e%2e/internal", "/api//internal", "/api%5cinternal"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 400 {
+			t.Fatalf("ambiguous %s accepted: %d", path, w.Code)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("rejected requests reached backend: %d", calls.Load())
+	}
+	req := httptest.NewRequest("GET", "/%61pi/%69nternal/user%20name", nil)
+	req.Header.Set("X-Key", "secret")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req)
+	if w.Code != 200 || w.Body.String() != "/user%20name" {
+		t.Fatalf("authorized encoded prefix stripping: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEncodedUnicodePrefix(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, r.RequestURI) }))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/café", Methods: []string{"GET"}, StripPrefix: true, Upstream: UpstreamConfig{URL: upstream.URL}})
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest("GET", "/caf%C3%A9/na%C3%AFve?q=%2F", nil))
+	if w.Code != 200 || w.Body.String() != "/na%C3%AFve?q=%2F" {
+		t.Fatalf("unicode path: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestStalledUploadIsBounded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.Copy(io.Discard, r.Body) }))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/", Methods: []string{"POST"}, Upstream: UpstreamConfig{URL: upstream.URL, Timeout: "50ms"}})
+	server := httptest.NewServer(g)
+	defer server.Close()
+	u, _ := url.Parse(server.URL)
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, err = fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Length: 100000\r\n\r\nx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("gateway failed to respond to stalled upload: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 504 {
+		t.Fatalf("got %d want 504", response.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("upload exceeded deadline: %v", elapsed)
+	}
+}
+
+func TestInterruptedUpstreamResponseIsNotSuccessful(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, buffer, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = buffer.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+		_ = buffer.Flush()
+	}))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}})
+	server := httptest.NewServer(g)
+	defer server.Close()
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get(server.URL)
+	if err != nil {
+		return
+	} // Aborting before buffered headers are flushed is also valid.
+	defer response.Body.Close()
+	if _, err := io.ReadAll(response.Body); err == nil {
+		t.Fatal("truncated upstream response looked complete")
+	}
+}
+
+func TestSlowDownstreamReaderIsBounded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		block := make([]byte, 64<<10)
+		for i := 0; i < 1024; i++ {
+			if _, err := w.Write(block); err != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL, Timeout: "50ms"}})
+	finished := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer close(finished); g.ServeHTTP(w, r) }))
+	defer server.Close()
+	u, _ := url.Parse(server.URL)
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.(*net.TCPConn).SetReadBuffer(1024); err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: gateway\r\n\r\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Do not read any response bytes; the gateway must release its blocked writer.
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow reader held the handler past its write deadline")
 	}
 }

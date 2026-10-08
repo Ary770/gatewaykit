@@ -5,6 +5,11 @@ work=$(mktemp -d)
 gateway_pid=''
 mock_pid=''
 cleanup() {
+  result=$?
+  if [ "$result" != 0 ]; then
+    printf '\nDemo failed; process logs:\n' >&2
+    cat "$work/mock.log" "$work/gateway.log" 2>/dev/null >&2 || true
+  fi
   if [ -n "$gateway_pid" ]; then kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; fi
   if [ -n "$mock_pid" ]; then kill "$mock_pid" 2>/dev/null || true; wait "$mock_pid" 2>/dev/null || true; fi
   rm -rf "$work"

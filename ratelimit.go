@@ -21,6 +21,7 @@ type rateLimiter struct {
 	window    time.Duration
 	buckets   map[string]*rateBucket
 	nextSweep time.Time
+	lastNow   time.Time
 	capacity  int
 }
 
@@ -37,6 +38,13 @@ func newRateLimiter(config *RateLimitConfig) *rateLimiter {
 func (l *rateLimiter) allow(key string, now time.Time) (allowed bool, retry time.Duration, capacity bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// A caller can capture time and then lose the lock to a later request. Keep
+	// evaluation time monotonic so sliding timestamps stay ordered under contention.
+	if now.Before(l.lastNow) {
+		now = l.lastNow
+	} else {
+		l.lastNow = now
+	}
 	if l.config.Per == "global" {
 		key = "global"
 	}

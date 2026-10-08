@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -18,25 +17,26 @@ import (
 )
 
 type route struct {
-	config      RouteConfig
-	escapedPath string
-	timeout     time.Duration
-	balancer    *balancer
-	limiter     *rateLimiter
+	config   RouteConfig
+	timeout  time.Duration
+	balancer *balancer
+	limiter  *rateLimiter
 }
 
 type Gateway struct {
-	routes    []*route
-	transport http.RoundTripper
-	started   time.Time
-	now       func() time.Time
+	routes         []*route
+	transport      http.RoundTripper
+	started        time.Time
+	defaultTimeout time.Duration
+	now            func() time.Time
 }
 
 func newGateway(c Config, transport http.RoundTripper) *Gateway {
-	g := &Gateway{transport: transport, started: time.Now(), now: time.Now}
+	defaultTimeout, _ := duration(c.Gateway.GlobalTimeout)
+	g := &Gateway{transport: transport, started: time.Now(), now: time.Now, defaultTimeout: defaultTimeout}
 	for _, rc := range c.Routes {
 		timeout, _ := duration(rc.Upstream.Timeout)
-		r := &route{config: rc, escapedPath: (&url.URL{Path: rc.Path}).EscapedPath(), timeout: timeout}
+		r := &route{config: rc, timeout: timeout}
 		r.balancer = newBalancer(rc.Upstream)
 		limit := rc.RateLimit
 		if limit == nil {
@@ -45,16 +45,21 @@ func newGateway(c Config, transport http.RoundTripper) *Gateway {
 		r.limiter = newRateLimiter(limit)
 		g.routes = append(g.routes, r)
 	}
-	sort.SliceStable(g.routes, func(i, j int) bool { return len(g.routes[i].escapedPath) > len(g.routes[j].escapedPath) })
+	sort.SliceStable(g.routes, func(i, j int) bool { return len(g.routes[i].config.Path) > len(g.routes[j].config.Path) })
 	return g
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	setClientDeadlines(w, g.defaultTimeout)
 	if req.Method == http.MethodGet && req.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "healthy", "uptime_seconds": int64(g.now().Sub(g.started).Seconds())})
 		return
 	}
-	r, allowed := g.match(req.URL.EscapedPath(), req.Method)
+	if ambiguousPath(req.URL) {
+		writeError(w, http.StatusBadRequest, "ambiguous_path")
+		return
+	}
+	r, allowed := g.match(req.URL.Path, req.Method)
 	if r == nil {
 		if len(allowed) > 0 {
 			w.Header().Set("Allow", strings.Join(allowed, ", "))
@@ -64,6 +69,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
+	setClientDeadlines(w, r.timeout)
 	if !authorized(req, r.config.Auth) {
 		w.Header().Set("WWW-Authenticate", `ApiKey realm="gatewaykit"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
@@ -89,7 +95,7 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 	var allowed []string
 	matchedLength := -1
 	for _, r := range g.routes {
-		prefix := r.escapedPath
+		prefix := r.config.Path
 		if matchedLength >= 0 && len(prefix) < matchedLength {
 			break
 		}
@@ -131,14 +137,12 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	out.Header.Set("X-Forwarded-Proto", proto)
 	response, err := g.transport.RoundTrip(out)
 	if err != nil {
-		if req.Context().Err() != nil {
-			return
-		}
 		status, message := http.StatusBadGateway, "bad_gateway"
 		var netErr net.Error
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
 		}
+		slog.Warn("upstream request failed", "route", r.config.Path, "target", target.Host, "category", message)
 		writeError(w, status, message)
 		return
 	}
@@ -162,8 +166,11 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 func upstreamURL(in, target *url.URL, r *route) *url.URL {
 	result := *target
 	path := in.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
 	if r.config.StripPrefix {
-		path = strings.TrimPrefix(path, r.escapedPath)
+		path = stripEscapedPrefix(path, r.config.Path)
 	}
 	if path == "" {
 		path = "/"
@@ -211,7 +218,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		slog.Debug("response write failed", "status", fmt.Sprint(status))
+		slog.Debug("response write failed", "status", status)
 	}
 }
 
@@ -228,4 +235,42 @@ func authorized(req *http.Request, auth *AuthConfig) bool {
 		matched |= subtle.ConstantTimeCompare([]byte(values[0]), []byte(key))
 	}
 	return matched == 1
+}
+
+// Reject paths that common backend routers normalize differently. Matching the
+// decoded path also prevents encoded ordinary characters from bypassing auth.
+func ambiguousPath(u *url.URL) bool {
+	raw := strings.ToLower(u.EscapedPath())
+	if strings.Contains(raw, "%2f") || strings.Contains(u.Path, "\\") || strings.Contains(u.Path, "//") {
+		return true
+	}
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// The decoded prefix has already matched. Each escape consumes one decoded byte,
+// so this preserves the raw encoding of the suffix, including UTF-8 bytes.
+func stripEscapedPrefix(raw, prefix string) string {
+	index := 0
+	for consumed := 0; consumed < len(prefix); consumed++ {
+		if raw[index] == '%' {
+			index += 3
+		} else {
+			index++
+		}
+	}
+	return raw[index:]
+}
+
+func setClientDeadlines(w http.ResponseWriter, timeout time.Duration) {
+	controller := http.NewResponseController(w)
+	deadline := time.Now().Add(timeout)
+	// Incoming request bodies and blocked downstream writes are independent of
+	// the outbound context. The write grace lets us send a 504 after a read timeout.
+	_ = controller.SetReadDeadline(deadline)
+	_ = controller.SetWriteDeadline(deadline.Add(time.Second))
 }
