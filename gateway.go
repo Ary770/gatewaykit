@@ -69,7 +69,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
-	setClientDeadlines(w, r.timeout)
+	deadline := setClientDeadlines(w, r.timeout)
 	if !authorized(req, r.config.Auth) {
 		w.Header().Set("WWW-Authenticate", `ApiKey realm="gatewaykit"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
@@ -88,7 +88,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	g.forward(w, req, r, r.balancer.next())
+	g.forward(w, req, r, r.balancer.next(), deadline)
 }
 
 func (g *Gateway) match(path, method string) (*route, []string) {
@@ -114,8 +114,8 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 	return nil, allowed
 }
 
-func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, target *url.URL) {
-	ctx, cancel := context.WithTimeout(req.Context(), r.timeout)
+func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, target *url.URL, deadline time.Time) {
+	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	defer cancel()
 	out := req.Clone(ctx)
 	out.RequestURI = ""
@@ -142,7 +142,9 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	if err != nil {
 		status, message := http.StatusBadGateway, "bad_gateway"
 		var netErr net.Error
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		// A downstream read deadline can cancel the parent context before the
+		// context timer reports DeadlineExceeded. The shared deadline is authoritative.
+		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
 		}
 		slog.Warn("upstream request failed", "route", r.config.Path, "target", target.Host, "category", message)
@@ -269,11 +271,12 @@ func stripEscapedPrefix(raw, prefix string) string {
 	return raw[index:]
 }
 
-func setClientDeadlines(w http.ResponseWriter, timeout time.Duration) {
+func setClientDeadlines(w http.ResponseWriter, timeout time.Duration) time.Time {
 	controller := http.NewResponseController(w)
 	deadline := time.Now().Add(timeout)
 	// Incoming request bodies and blocked downstream writes are independent of
 	// the outbound context. The write grace lets us send a 504 after a read timeout.
 	_ = controller.SetReadDeadline(deadline)
 	_ = controller.SetWriteDeadline(deadline.Add(time.Second))
+	return deadline
 }
