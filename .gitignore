@@ -1,0 +1,4 @@
+/bin/
+/coverage.out
+*.zip
+.DS_Store
