@@ -146,6 +146,9 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 		// context timer reports DeadlineExceeded. The shared deadline is authoritative.
 		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
+			// A read timeout cancels net/http's connection context permanently.
+			// Close it so the next request starts on a healthy connection.
+			w.Header().Set("Connection", "close")
 		}
 		slog.Warn("upstream request failed", "route", r.config.Path, "target", target.Host, "category", message)
 		writeError(w, status, message)

@@ -371,6 +371,9 @@ func TestStalledUploadIsBounded(t *testing.T) {
 	if response.StatusCode != 504 {
 		t.Fatalf("got %d want 504", response.StatusCode)
 	}
+	if !response.Close {
+		t.Fatal("stalled upload connection must close after timeout")
+	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("upload exceeded deadline: %v", elapsed)
 	}
@@ -433,5 +436,53 @@ func TestSlowDownstreamReaderIsBounded(t *testing.T) {
 	case <-finished:
 	case <-time.After(2 * time.Second):
 		t.Fatal("slow reader held the handler past its write deadline")
+	}
+}
+
+func TestTimeoutClosesConnectionBeforeNextRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			_, _ = io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, "healthy")
+	}))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/", Methods: []string{"GET", "POST"}, Upstream: UpstreamConfig{URL: upstream.URL, Timeout: "50ms"}})
+	server := httptest.NewServer(g)
+	defer server.Close()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
+	for _, method := range []string{"GET", "POST"} {
+		t.Run(method, func(t *testing.T) {
+			for _, path := range []string{"/healthy", "/slow", "/healthy", "/healthy"} {
+				var requestBody io.Reader
+				if method == http.MethodPost {
+					requestBody = strings.NewReader("demo")
+				}
+				req, err := http.NewRequest(method, server.URL+path, requestBody)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if path == "/slow" {
+					if response.StatusCode != 504 || !response.Close {
+						t.Fatalf("timeout status=%d close=%v; want 504 and closed connection", response.StatusCode, response.Close)
+					}
+				} else if response.StatusCode != 200 || string(body) != "healthy" {
+					t.Fatalf("request after timeout: status=%d body=%s", response.StatusCode, body)
+				}
+			}
+		})
 	}
 }

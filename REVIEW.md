@@ -36,6 +36,7 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 | Concurrent callers could append sliding-window timestamps out of order and expire live quota | Clamp effective evaluation time monotonically inside the limiter lock | `TestSlidingWindowReorderedConcurrentTimestamps` |
 | Canceling an outbound context did not unblock a stalled inbound upload | Apply downstream read deadlines and a bounded write grace independently of the upstream context | `TestStalledUploadIsBounded`, `TestSlowDownstreamReaderIsBounded` |
 | Simultaneous socket/context expiration could misclassify a timeout as 502 | Use one shared deadline and consult it when categorizing transport failures | Independent 100-repeat run of stalled-upload and upstream-failure tests |
+| Browser reused a connection whose context was canceled by a read deadline, causing later requests to return 502 | Close the downstream connection on timeout responses so clients reconnect | `TestTimeoutClosesConnectionBeforeNextRequest`, stalled-upload closure assertion; independent 20/20 live GET/POST sequences |
 | Proxy contract test could hang when forwarding failed before reaching its mock | Bounded channel observation with response diagnostics | `TestProxyPreservesRequestAndResponse` |
 | Downstream connection state could leak into upstream framing/pooling | Clear `Close`, trailers, and incoming transfer-encoding metadata before the transport creates its own framing | `TestProxyPreservesRequestAndResponse` |
 | Upstream failures lacked target/category diagnostics; demo failures discarded logs | Sanitized route/target/category logging; print child-process logs on demo failure | Code review and live demo |
@@ -54,6 +55,15 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 - Independent shutdown probe: exit status 0; the unit suite additionally verifies active-request draining.
 - Final independent `go test -race -run 'TestStalledUploadIsBounded|TestUpstreamFailureAndTimeout' -count=100 .`: PASS (10.438 seconds), after the clean-extraction race correction.
 - Focused uncached regressions for stalled uploads, slow readers, truncated responses, and encoded Unicode paths: PASS in the application review.
+
+## Live browser follow-up
+
+A browser demo exposed a persistent-connection defect that the original isolated requests did not catch: a timeout canceled the connection context, and later requests on that connection returned 502. Timeout responses now close that connection. A reused client recovers automatically on the next request.
+
+- New bodyless GET and POST timeout/recovery regressions, plus the stalled-upload test: PASS under the race detector for 100 repetitions (18.161 seconds).
+- Independent fresh-binary verification: 20/20 sequences returned `200 → 504 → 200 → 200`.
+- Full live functional suite: 20/20 checks passed, including 80 concurrent weighted requests (60:20), 20-request quota burst (3:17), auth/path protection, and recovery after quota expiry.
+- Chrome main demo followed by 20 simultaneous requests: exactly 3 accepted and 17 rate limited; no unexpected 502 responses.
 
 ## Accepted scope limitations
 
