@@ -70,7 +70,7 @@ func TestConfigDeferredFeaturesWarn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(warnings) != 5 {
+	if len(warnings) != 3 {
 		t.Fatalf("warnings: %v", warnings)
 	}
 }
@@ -99,7 +99,7 @@ func TestProvidedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Routes) != 5 || len(warnings) != 5 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
+	if len(c.Routes) != 5 || len(warnings) != 3 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
 		t.Fatalf("provided config not represented correctly: routes=%d warnings=%v", len(c.Routes), warnings)
 	}
 	if _, warnings, err := loadConfig("examples/demo.yaml"); err != nil || len(warnings) != 0 {

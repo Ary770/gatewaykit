@@ -69,11 +69,11 @@ This builds and starts the real application and mock upstreams, asserts response
 | API-key authentication | Implemented |
 | Round robin and smooth weighted round robin | Implemented |
 | Retry and backoff | Deferred; warned and ignored |
-| Request/response header and body transformations | Deferred; warned and ignored |
+| Request/response header and body transformations | Implemented (follow-up) |
 | Active upstream health checks | Deferred; warned and ignored |
 | Circuit breaker | Deferred; warned and ignored |
 
-Deferred settings are accepted so the provided configuration can start, but they do **not** affect requests. For example, `/api/legacy` forwards the original payload without transforming it, and failed backends stay eligible for balancing. These are explicit omissions, not partial implementations.
+Deferred settings are accepted so the provided configuration can start, but they do **not** affect requests. Failed backends still remain eligible for balancing. These are explicit omissions, not partial implementations.
 
 ## Defined behavior
 
@@ -92,3 +92,21 @@ Deferred settings are accepted so the provided configuration can start, but they
 State is in-memory and local to one process; restart resets counters and balancing. There is no config reload, distributed quota, TLS listener, trusted-proxy list, admin API, metrics export, HTTP upgrade/WebSocket tunnel, or trailer forwarding. Deploying behind another proxy groups clients by that proxy's socket IP. This submission is a take-home implementation, not a hardened Internet-facing gateway.
 
 See [DECISIONS.md](DECISIONS.md) for prioritization, architectural trade-offs, and next steps.
+
+### Follow-up transformations
+
+`request_transform.headers` and `response_transform.headers` support `add` and
+`remove`; framing and gateway-derived identity headers are protected. Header-only
+rules retain streaming. Request body `mapping` replaces the original object:
+keys are destination dot paths, values are source dot paths or `$literal:...`,
+`$request_time`, and `$route_path`. Missing sources become null; arrays are copied
+as values. Response `envelope` recursively resolves `$body`, `$response_time`,
+`$request_time`, and `$route_path`. Times use UTC RFC3339Nano.
+
+Body transforms require JSON media types and identity encoding, preserve numbers,
+and bound both input and output to 1 MiB. Malformed client JSON returns 400,
+unsupported media/encoding 415, and oversized bodies 413. Invalid or oversized
+upstream bodies return 502; deadline expiry returns 504 before response headers.
+Empty requests remain empty; HEAD, 204 and 304 responses retain bodyless semantics.
+Rewritten bodies receive JSON content type and discard stale representation metadata,
+even when header rules specify those metadata fields.

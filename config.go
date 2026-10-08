@@ -23,17 +23,17 @@ type GatewayConfig struct {
 }
 
 type RouteConfig struct {
-	HealthCheck       yaml.Node        `yaml:"health_check"`
-	Path              string           `yaml:"path"`
-	Methods           []string         `yaml:"methods"`
-	StripPrefix       bool             `yaml:"strip_prefix"`
-	Upstream          UpstreamConfig   `yaml:"upstream"`
-	RateLimit         *RateLimitConfig `yaml:"rate_limit"`
-	Auth              *AuthConfig      `yaml:"auth"`
-	Retry             yaml.Node        `yaml:"retry"`
-	RequestTransform  yaml.Node        `yaml:"request_transform"`
-	ResponseTransform yaml.Node        `yaml:"response_transform"`
-	CircuitBreaker    yaml.Node        `yaml:"circuit_breaker"`
+	HealthCheck       yaml.Node                `yaml:"health_check"`
+	Path              string                   `yaml:"path"`
+	Methods           []string                 `yaml:"methods"`
+	StripPrefix       bool                     `yaml:"strip_prefix"`
+	Upstream          UpstreamConfig           `yaml:"upstream"`
+	RateLimit         *RateLimitConfig         `yaml:"rate_limit"`
+	Auth              *AuthConfig              `yaml:"auth"`
+	Retry             yaml.Node                `yaml:"retry"`
+	RequestTransform  *RequestTransformConfig  `yaml:"request_transform"`
+	ResponseTransform *ResponseTransformConfig `yaml:"response_transform"`
+	CircuitBreaker    yaml.Node                `yaml:"circuit_breaker"`
 }
 
 type UpstreamConfig struct {
@@ -171,12 +171,14 @@ func (c *Config) validate() ([]string, error) {
 				}
 			}
 		}
+		if err := validateTransforms(*r); err != nil {
+			return nil, fmt.Errorf("%s.transform: %w", label, err)
+		}
 		for _, feature := range []struct {
 			name string
 			node yaml.Node
 		}{
-			{"retry", r.Retry}, {"request_transform", r.RequestTransform},
-			{"response_transform", r.ResponseTransform}, {"circuit_breaker", r.CircuitBreaker},
+			{"retry", r.Retry}, {"circuit_breaker", r.CircuitBreaker},
 			{"health_check", r.HealthCheck},
 		} {
 			if feature.node.Kind != 0 {

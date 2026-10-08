@@ -146,6 +146,15 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 		proto = "https"
 	}
 	out.Header.Set("X-Forwarded-Proto", proto)
+	values := transformValues{requestTime: g.now().UTC().Format(time.RFC3339Nano), route: r.config.Path}
+	if status, err := g.transformRequest(out, r, values); err != nil {
+		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+			w.Header().Set("Connection", "close")
+		}
+		writeError(w, status, "request_transform_failed")
+		return
+	}
 	response, err := g.transport.RoundTrip(out)
 	if err != nil {
 		status, message := http.StatusBadGateway, "bad_gateway"
@@ -165,6 +174,16 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusSwitchingProtocols {
 		writeError(w, http.StatusBadGateway, "unsupported_protocol_upgrade")
+		return
+	}
+	removeHopHeaders(response.Header)
+	if err := g.transformResponse(response, req, r, values); err != nil {
+		status := http.StatusBadGateway
+		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+			w.Header().Set("Connection", "close")
+		}
+		writeError(w, status, "response_transform_failed")
 		return
 	}
 	removeHopHeaders(response.Header)

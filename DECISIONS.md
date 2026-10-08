@@ -57,3 +57,14 @@ Codex generated and edited code and tests under an approved feature plan. A sepa
 The first independent review reproduced three boundary defects: literal escaped-path matching could choose a weaker policy than the backend's decoded path; timestamps captured before limiter locking could be appended out of order; and an outbound context deadline could not interrupt a blocked inbound-body read. Corrections match decoded paths and reject ambiguous forms, keep limiter evaluation time nondecreasing under the lock, and set independent downstream read/write deadlines. Regression tests cover all three, including real stalled sockets. The review also prompted categorized upstream failure logs and preserving demo logs when an assertion fails.
 
 A clean ZIP extraction subsequently exposed a timing-dependent 502/504 classification race. The downstream read deadline can cancel the request context before its deadline timer records `DeadlineExceeded`. The final correction uses one shared deadline for socket and upstream operations and consults it when classifying errors. Both the implementation pass and independent reviewer repeated the stalled-upload regression 100 times under the race detector before repackaging.
+
+## Follow-up: transformations
+
+After the original time-box, request mapping and response envelopes were added
+with typed configuration and startup validation. The original core remains tagged.
+The implementation supports the supplied expressions directly rather than adding
+an expression engine. Body transforms buffer at most 1 MiB of input and reject
+output above that limit; all other forwarding remains streamed. Missing mapped
+fields become null, arrays are values rather than indexed paths, and conflicting
+destinations fail startup. Representation metadata is rebuilt after body changes.
+Retries, health checks and circuit breakers remain deferred at this stage.
