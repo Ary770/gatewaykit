@@ -151,4 +151,20 @@ ports 18080, 13001 and 13002 without disturbing the core demo on port 8080.
 
 ## Browser demo
 
-Run `python3 demo/run.py`, then open http://127.0.0.1:8080/demo/index.html. This builds the current application and starts all local demo services. Python 3 is needed only for demo tooling. Press Ctrl+C to stop. See [DEMO.md](DEMO.md) for details and automated functional checks.
+Clone the submission branch (repository access is required), or extract the submission ZIP and enter its `gatewaykit` directory:
+
+```sh
+git clone --branch feature/complete-gateway-features https://github.com/Ary770/gatewaykit.git
+cd gatewaykit
+python3 demo/run.py
+```
+
+Open http://127.0.0.1:8080/demo/index.html. The launcher builds the current application and starts the gateway, all mock backends, and the demo page server. Go and Python 3 must be installed; the first build downloads the pinned Go toolchain and YAML dependency if needed. Ports 8080, 3099, and 3001–3006 must be free. Press Ctrl+C to stop all demo services.
+
+For an automated check that launches the same services, runs all 24 live scenarios, and stops them:
+
+```sh
+python3 demo/run.py --check
+```
+
+Python is needed only for demo tooling. See [DEMO.md](DEMO.md) for details. The submission branch contains the complete implementation and browser demo; `main` and the core tag preserve the original baseline.
