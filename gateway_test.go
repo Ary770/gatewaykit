@@ -50,7 +50,8 @@ func TestProxyPreservesRequestAndResponse(t *testing.T) {
 	g := testGateway(t, RouteConfig{Path: "/api/users", Methods: []string{"POST"}, Upstream: UpstreamConfig{URL: upstream.URL + "/base?fixed=1"}})
 	req := httptest.NewRequest("POST", "http://gateway/api/users/a%20b?q=a%20b&q=c", strings.NewReader(`{"name":"Ada"}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Connection", "X-Secret")
+	req.Header.Set("Connection", "close, X-Secret")
+	req.Close = true
 	req.Header.Set("X-Secret", "remove")
 	req.Header.Set("X-Forwarded-For", "spoofed")
 	req.RemoteAddr = "192.0.2.25:1234"
@@ -66,7 +67,7 @@ func TestProxyPreservesRequestAndResponse(t *testing.T) {
 		t.Fatalf("upstream request: %+v", got)
 	}
 	target, _ := url.Parse(upstream.URL)
-	if got.host != target.Host || got.header.Get("X-Secret") != "" || got.header.Get("X-Forwarded-For") != "192.0.2.25" || got.header.Get("Content-Type") != "application/json" {
+	if got.host != target.Host || got.header.Get("X-Secret") != "" || got.header.Get("Connection") != "" || got.header.Get("X-Forwarded-For") != "192.0.2.25" || got.header.Get("Content-Type") != "application/json" {
 		t.Fatalf("upstream headers: %+v", got)
 	}
 	if result.Code != 201 || result.Body.String() != `{"created":true}` || result.Header().Get("X-Private") != "" || result.Header().Get("X-Public") != "keep" || len(result.Header().Values("Set-Cookie")) != 2 {

@@ -119,6 +119,9 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	defer cancel()
 	out := req.Clone(ctx)
 	out.RequestURI = ""
+	out.Close = false
+	out.Trailer = nil
+	out.TransferEncoding = nil
 	out.URL = upstreamURL(req.URL, target, r)
 	out.Host = target.Host
 	out.Header = req.Header.Clone()
