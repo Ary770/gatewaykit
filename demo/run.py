@@ -18,6 +18,7 @@ REQUIRED_PORTS = (8080, 3099, *range(3001, 3007))
 def require_available_ports():
     for port in REQUIRED_PORTS:
         with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 listener.bind(("127.0.0.1", port))
             except OSError as error:
