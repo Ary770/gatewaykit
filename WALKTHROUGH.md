@@ -82,6 +82,8 @@ Two details worth explaining if asked:
 >
 > Fixed windows count requests from the start of a window. Sliding windows keep the accepted request times and remove the ones that are too old.
 
+Start at `allow`: it keeps the whole decision under one lock, makes the evaluation time monotonic, cleans expired buckets, finds the client bucket, and calls the selected window algorithm. `allowFixedWindow` and `allowSlidingWindow` each own their quota rule. The returned `rateLimitDecision` names the outcome and retry delay; `allowRateLimitedRequest` in the gateway translates it into an HTTP response.
+
 `per: ip` uses the client's connection address. `per: global` shares one count across all clients of that route. The gateway-level policy supplies the default for each route; a route override replaces it.
 
 > I don't trust a client-supplied IP header. Otherwise someone could change the header on every request to avoid the limit.

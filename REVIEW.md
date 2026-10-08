@@ -44,7 +44,7 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 
 ## Verification results
 
-- `go test -race -cover ./...`: PASS. Gateway statement coverage **93.1%**; mock command **87.5%**.
+- `go test -race -cover ./...`: PASS. Gateway statement coverage **93.4%**; mock command **87.5%**.
 - `go vet ./...`: PASS.
 - `go mod verify`: PASS; all modules verified.
 - `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`: PASS on Go 1.26.9, **No vulnerabilities found.** The scanner is an external verification tool, not a project/runtime dependency.
@@ -64,6 +64,12 @@ A browser demo exposed a persistent-connection defect that the original isolated
 - Independent fresh-binary verification: 20/20 sequences returned `200 → 504 → 200 → 200`.
 - Full live functional suite: 20/20 checks passed, including 80 concurrent weighted requests (60:20), 20-request quota burst (3:17), auth/path protection, and recovery after quota expiry.
 - Chrome main demo followed by 20 simultaneous requests: exactly 3 accepted and 17 rate limited; no unexpected 502 responses.
+
+## Readability follow-up
+
+The limiter now separates time ordering, expired-bucket cleanup, bucket allocation, and each window algorithm. A named decision replaces the positional `(allowed, retry, capacity)` result. The gateway translates this decision into HTTP responses in a separate function with early returns.
+
+The independent review found no behavior changes or remaining readability issue in this diff. Focused limiter and gateway-policy tests passed under the race detector, including 20 repeated runs. Existing tests still cover concurrency, exact window boundaries, capacity exhaustion, and reordered timestamps; assertions now distinguish quota rejection from identity-capacity rejection explicitly.
 
 ## Accepted scope limitations
 

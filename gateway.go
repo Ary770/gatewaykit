@@ -75,20 +75,28 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if r.limiter != nil {
-		allowed, retry, capacity := r.limiter.allow(clientIP(req), g.now())
-		if !allowed {
-			seconds := max(int64(1), int64((retry-1)/time.Second)+1)
-			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-			if !capacity {
-				writeError(w, http.StatusServiceUnavailable, "rate_limit_capacity_exceeded")
-			} else {
-				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded")
-			}
-			return
-		}
+	if !g.allowRateLimitedRequest(w, req, r.limiter) {
+		return
 	}
 	g.forward(w, req, r, r.balancer.next(), deadline)
+}
+
+func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Request, limiter *rateLimiter) bool {
+	if limiter == nil {
+		return true
+	}
+	decision := limiter.allow(clientIP(req), g.now())
+	if decision.allowed {
+		return true
+	}
+	retrySeconds := max(int64(1), int64((decision.retryAfter-1)/time.Second)+1)
+	w.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+	if decision.capacityExceeded {
+		writeError(w, http.StatusServiceUnavailable, "rate_limit_capacity_exceeded")
+		return false
+	}
+	writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded")
+	return false
 }
 
 func (g *Gateway) match(path, method string) (*route, []string) {
