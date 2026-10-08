@@ -1,5 +1,5 @@
 # Configuration supplied in the GatewayKit requirements.
-# Deferred features emit startup warnings; see README.md.
+# All configured features are implemented; see README.md for safety boundaries.
 gateway:
   port: 8080
   global_timeout: "30s"

@@ -30,7 +30,7 @@ type RouteConfig struct {
 	Upstream          UpstreamConfig           `yaml:"upstream"`
 	RateLimit         *RateLimitConfig         `yaml:"rate_limit"`
 	Auth              *AuthConfig              `yaml:"auth"`
-	Retry             yaml.Node                `yaml:"retry"`
+	Retry             *RetryConfig             `yaml:"retry"`
 	RequestTransform  *RequestTransformConfig  `yaml:"request_transform"`
 	ResponseTransform *ResponseTransformConfig `yaml:"response_transform"`
 	CircuitBreaker    *CircuitBreakerConfig    `yaml:"circuit_breaker"`
@@ -130,7 +130,6 @@ func (c *Config) validate() ([]string, error) {
 		return nil, fmt.Errorf("gateway.global_rate_limit: %w", err)
 	}
 	seen := map[string]bool{}
-	var warnings []string
 	for i := range c.Routes {
 		r := &c.Routes[i]
 		label := fmt.Sprintf("routes[%d]", i)
@@ -208,18 +207,12 @@ func (c *Config) validate() ([]string, error) {
 		if err := validateCircuitBreaker(r.CircuitBreaker); err != nil {
 			return nil, fmt.Errorf("%s.circuit_breaker: %w", label, err)
 		}
-		for _, feature := range []struct {
-			name string
-			node yaml.Node
-		}{
-			{"retry", r.Retry},
-		} {
-			if feature.node.Kind != 0 {
-				warnings = append(warnings, fmt.Sprintf("%s: %s is configured but NOT IMPLEMENTED; this setting has no effect", r.Path, feature.name))
-			}
+		if err := validateRetry(r.Retry); err != nil {
+			return nil, fmt.Errorf("%s.retry: %w", label, err)
 		}
+
 	}
-	return warnings, nil
+	return nil, nil
 }
 
 func validateLimit(c *RateLimitConfig) error {

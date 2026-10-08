@@ -2,7 +2,7 @@
 
 ## Scope and priorities
 
-The original two-hour submission is preserved at tag `core-submission-2026-10-08`. It prioritized real HTTP proxying, timeouts, authentication, rate limiting and balancing. Follow-up work has added transformations, active health checks and circuit breakers; retries are the remaining deferred feature.
+The original two-hour submission is preserved at tag `core-submission-2026-10-08`. It prioritized real HTTP proxying, timeouts, authentication, rate limiting and balancing. Follow-up work has added all four features: transformations, active health checks, circuit breakers and safe gateway-managed retries.
 
 ## Implementation plan
 
@@ -18,7 +18,7 @@ Go's standard HTTP server and transport provide connection handling; the gateway
 
 `main.go` owns configuration selection, listener lifecycle, signal handling, and transport reuse. `config.go` parses and validates the schema once. `gateway.go` contains the visible request pipeline and HTTP forwarding. `ratelimit.go` and `balancer.go` own their mutable state and locks. Tests live alongside each module; `cmd/mock` is a separate demonstration command.
 
-The pipeline is health -> route/method -> authentication -> rate limit -> backend selection -> forwarding. Authentication precedes rate limiting so invalid keys cannot exhaust an authorized client's quota. Each route owns a limiter and balancer. Network I/O never occurs while either lock is held. No middleware registry, plugin system, dependency-injection container, or shared data store was needed for this scope.
+The pipeline is liveness -> route/method -> authentication -> rate limit -> request transformation/replay preparation -> backend selection -> circuit admission -> attempt/backoff loop -> final response transformation/forwarding -> breaker completion. Authentication precedes rate limiting so invalid keys cannot exhaust an authorized client's quota. Each route owns a limiter and balancer. Network I/O never occurs while either lock is held. No middleware registry, plugin system, dependency-injection container, or shared data store was needed for this scope.
 
 ## Proxy choices
 
@@ -34,7 +34,7 @@ Bodies are streamed to avoid a memory cost proportional to payload size. A timeo
 - A global rate limit is a default copied to each route, following the example's "unless overridden" comment. `per: global` means all clients of that route, not all routes together.
 - Fixed windows start on first accepted request. Sliding windows use exact timestamp histories. Both exclude rejected requests.
 - Socket IP is the identity. Trusting arbitrary `X-Forwarded-For` would let a client evade limits. Trusted proxy configuration would be a separate feature.
-- Unsupported configuration produces explicit warnings rather than failing startup, because the supplied config includes every stretch feature and must still run. This compatibility choice is appropriate for the exercise, but a production version should offer strict capability validation.
+- The original submission warned about deferred features. The follow-up uses typed, strictly validated configuration for every supplied feature; malformed fields now fail startup.
 
 ## Why these features came first
 
@@ -46,7 +46,7 @@ Retries were deferred because retrying POST/PUT requests can duplicate side effe
 
 The route scan is linear, appropriate for a small static route list. A mutex serializes each route's limiter bookkeeping and backend selection; it never serializes proxy I/O. Exact sliding windows use memory proportional to accepted requests retained in the active window. Identity tables have a 10,000-entry cap per route and lazy expiration; limits are not durable or shared across replicas.
 
-Next, I would implement transformations with bounded buffering and explicit JSON failure contracts, then retry behavior restricted by idempotency policy. Circuit breakers would follow with controllable clocks and recovery tests. Before production use, I would add traffic metrics, structured failure categorization, trusted-proxy configuration, end-to-end resource limits, and load tests. More features are less valuable than proving the deployed operating limits.
+The four originally deferred features are now implemented and tested. Before production use, I would add traffic metrics, structured failure categorization, trusted-proxy configuration, end-to-end resource limits, and load tests. More features are less valuable than proving the deployed operating limits.
 
 ## AI use and verification
 
@@ -67,8 +67,34 @@ an expression engine. Body transforms buffer at most 1 MiB of input and reject
 output above that limit; all other forwarding remains streamed. Missing mapped
 fields become null, arrays are values rather than indexed paths, and conflicting
 destinations fail startup. Representation metadata is rebuilt after body changes.
-Retries, health checks and circuit breakers remain deferred at this stage.
+Health checks, circuit breakers and retries were integrated in subsequent follow-up commits.
 
 ## Follow-up circuit breakers
 
 One route-owned breaker counts completed upstream failures in a rolling window. A single recovery probe and generation guards prevent concurrent or stale responses from resetting newer state. Local errors and client cancellation release probes neutrally.
+
+## Follow-up retries and integration
+
+Retries are bounded by total attempts and one deadline. Only idempotent HTTP
+methods receive gateway-managed retries; a key on POST/PATCH is not enough to
+prove a backend's idempotency implementation. Replay bodies are prepared once,
+after transformation, and capped at 1 MiB before the first send. This explicit
+413 policy avoids sending a partial body or silently changing retry guarantees.
+Routes without replay or transformation continue streaming. Go's transport can
+also recover replayable requests internally; the configured count is gateway
+attempts and not a guarantee of backend execution count.
+
+One rate-limit charge and one breaker result belong to each logical request.
+Discarded retry responses are never transformed. Health probes bypass client
+policies and affect only target eligibility; they cannot close a route breaker.
+Late breaker outcomes are generation-checked. Upload errors and client cancellation
+are neutral; truncated upstream reads count as failures, including buffered JSON
+reads. Local transform validation/expansion failures are neutral unless the final
+upstream status itself is 5xx. Tests combine all four features on one route and
+exercise real connection failures, cancellation, recovery and stalled uploads.
+
+Workers used isolated worktrees for transformations, health checks and breaker
+state; an integration owner reviewed and landed each independently, owned retries,
+and ran the combined race suite and executable demos. The original tagged
+submission remains available for comparison; the follow-up is not represented as
+work completed during the original two-hour baseline.

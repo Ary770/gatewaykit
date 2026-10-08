@@ -84,12 +84,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !g.allowRateLimitedRequest(w, req, r.limiter) {
 		return
 	}
-	target := r.balancer.next()
-	if target == nil {
-		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
-		return
-	}
-	g.forward(w, req, r, target, deadline)
+	g.forward(w, req, r, deadline)
 }
 
 func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Request, limiter *rateLimiter) bool {
@@ -133,7 +128,7 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 	return nil, allowed
 }
 
-func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, target *url.URL, deadline time.Time) {
+func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, deadline time.Time) {
 	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	defer cancel()
 	out := req.Clone(ctx)
@@ -141,8 +136,6 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	out.Close = false
 	out.Trailer = nil
 	out.TransferEncoding = nil
-	out.URL = upstreamURL(req.URL, target, r)
-	out.Host = target.Host
 	out.Header = req.Header.Clone()
 	removeHopHeaders(out.Header)
 	// Forwarded identity is derived from the socket, never from client-supplied headers.
@@ -166,6 +159,24 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 		writeError(w, status, "request_transform_failed")
 		return
 	}
+	attempts, err := prepareRetry(out, r.config.Retry)
+	if err != nil {
+		status, message := http.StatusBadRequest, "request_body_read_failed"
+		if errors.Is(err, errReplayBodyTooLarge) {
+			status, message = http.StatusRequestEntityTooLarge, "retry_body_too_large"
+		}
+		if upstreamErrorStatus(err, ctx) == http.StatusGatewayTimeout {
+			status, message = http.StatusGatewayTimeout, "gateway_timeout"
+			w.Header().Set("Connection", "close")
+		}
+		writeError(w, status, message)
+		return
+	}
+	target := r.balancer.next()
+	if target == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
+		return
+	}
 	var upload *observedRequestBody
 	if out.Body != nil {
 		upload = &observedRequestBody{ReadCloser: out.Body}
@@ -185,20 +196,23 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 		}
 		permit.finish(outcome, g.now())
 	}()
-	response, err := g.transport.RoundTrip(out)
+	response, err := g.roundTripAttempts(out, r, req.URL, target, attempts, r.config.Retry)
 	if err != nil {
+		if errors.Is(err, errNoHealthyBackends) {
+			writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
+			return
+		}
 		outcome = breakerFailure
 		status, message := http.StatusBadGateway, "bad_gateway"
-		var netErr net.Error
 		// A downstream read deadline can cancel the parent context before the
 		// context timer reports DeadlineExceeded. The shared deadline is authoritative.
-		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		if upstreamErrorStatus(err, ctx) == http.StatusGatewayTimeout {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
 			// A read timeout cancels net/http's connection context permanently.
 			// Close it so the next request starts on a healthy connection.
 			w.Header().Set("Connection", "close")
 		}
-		slog.Warn("upstream request failed", "route", r.config.Path, "target", target.Host, "category", message)
+		slog.Warn("upstream request failed", "route", r.config.Path, "category", message)
 		writeError(w, status, message)
 		return
 	}

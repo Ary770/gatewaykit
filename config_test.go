@@ -59,9 +59,9 @@ func TestConfigInvalid(t *testing.T) {
 	}
 }
 
-func TestConfigDeferredFeaturesWarn(t *testing.T) {
+func TestConfigAllFeaturesValidate(t *testing.T) {
 	input := minimalConfig + `    health_check: {path: /healthz, interval: 1s}
-    retry: {attempts: 3}
+    retry: {attempts: 3, backoff: fixed, initial_delay: 1ms, on: [503]}
     request_transform: {headers: {add: {X-Test: yes}}}
     response_transform: {body: {envelope: {data: $body}}}
     circuit_breaker: {threshold: 5, window: "60s", cooldown: "30s"}
@@ -70,7 +70,7 @@ func TestConfigDeferredFeaturesWarn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(warnings) != 1 {
+	if len(warnings) != 0 {
 		t.Fatalf("warnings: %v", warnings)
 	}
 }
@@ -99,7 +99,7 @@ func TestProvidedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Routes) != 5 || len(warnings) != 1 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
+	if len(c.Routes) != 5 || len(warnings) != 0 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
 		t.Fatalf("provided config not represented correctly: routes=%d warnings=%v", len(c.Routes), warnings)
 	}
 	if _, warnings, err := loadConfig("examples/demo.yaml"); err != nil || len(warnings) != 0 {
