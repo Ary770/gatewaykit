@@ -24,7 +24,7 @@ Confidence: high · Mode: General · Bar: two-hour take-home submission
 
 The first panel reviewed source at `d0ece7f` through six lenses: architecture, state/data modeling, security, code quality, performance, and operability. Review agents were read-only; the implementing agent owned all fixes and commits.
 
-The second full code reviewer and the second application reviewer inspected `a49fa17` after the corrections. They were separate from the implementing agent and independently ran checks. Subsequent commits add documentation only.
+The second full code reviewer and the second application reviewer inspected `a49fa17` after the corrections. They were separate from the implementing agent and independently ran checks. A clean-extraction check then exposed a rare 502/504 classification race. The focused correction at `d1f3fc6` shares one deadline between downstream sockets and the upstream context; the independent code reviewer inspected that final diff and passed 100 repeated timeout/failure regressions. Subsequent commits add documentation only.
 
 Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.go`, `cmd/mock`, the corresponding tests, the example configurations, and the demo script. README, DECISIONS, and WALKTHROUGH were checked against application behavior.
 
@@ -35,6 +35,7 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 | Encoded path could select a public route while backend interpreted a protected path | Match decoded paths; reject encoded slashes, backslashes, repeated slashes, and dot segments; preserve unambiguous escaped suffixes | `TestEncodedPathsCannotBypassAuthentication`, `TestEncodedUnicodePrefix` |
 | Concurrent callers could append sliding-window timestamps out of order and expire live quota | Clamp effective evaluation time monotonically inside the limiter lock | `TestSlidingWindowReorderedConcurrentTimestamps` |
 | Canceling an outbound context did not unblock a stalled inbound upload | Apply downstream read deadlines and a bounded write grace independently of the upstream context | `TestStalledUploadIsBounded`, `TestSlowDownstreamReaderIsBounded` |
+| Simultaneous socket/context expiration could misclassify a timeout as 502 | Use one shared deadline and consult it when categorizing transport failures | Independent 100-repeat run of stalled-upload and upstream-failure tests |
 | Proxy contract test could hang when forwarding failed before reaching its mock | Bounded channel observation with response diagnostics | `TestProxyPreservesRequestAndResponse` |
 | Downstream connection state could leak into upstream framing/pooling | Clear `Close`, trailers, and incoming transfer-encoding metadata before the transport creates its own framing | `TestProxyPreservesRequestAndResponse` |
 | Upstream failures lacked target/category diagnostics; demo failures discarded logs | Sanitized route/target/category logging; print child-process logs on demo failure | Code review and live demo |
@@ -51,6 +52,7 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 - Independent fresh-binary stalled-upload probe: `504` in **0.104 seconds** with a 100ms timeout. The pre-fix binary did not respond within one second.
 - Independent keep-alive probe: unreachable backend `502`, health `200`, then backend `502` on a reused client across deadline boundaries.
 - Independent shutdown probe: exit status 0; the unit suite additionally verifies active-request draining.
+- Final independent `go test -race -run 'TestStalledUploadIsBounded|TestUpstreamFailureAndTimeout' -count=100 .`: PASS (10.438 seconds), after the clean-extraction race correction.
 - Focused uncached regressions for stalled uploads, slow readers, truncated responses, and encoded Unicode paths: PASS in the application review.
 
 ## Accepted scope limitations
