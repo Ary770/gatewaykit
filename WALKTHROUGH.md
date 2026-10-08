@@ -8,7 +8,7 @@ Use this as speaking notes. Start with the overview, show the demo, then follow 
 >
 > I started with routing and basic proxying. Then I added timeouts, API-key checks, rate limits, and weighted load balancing. I focused on making those work correctly, including when requests arrive together or a backend fails.
 >
-> Retries, transformations, health checks, and circuit breakers are still deferred. The app warns when they're configured, and the README lists what's implemented.
+> I preserved that core baseline, then added bounded transformations, active health checks, circuit breakers, and safe retries in separate reviewed commits. The README explains their safety boundaries.
 
 ## What I'd show in 30 minutes
 
@@ -55,13 +55,13 @@ A transport sends the HTTP request. Our code still decides where to send it and 
 >
 > Defaults are resolved once. Each request uses the settings we've already loaded.
 
-Point out that the timeout override is under `upstream.timeout`. Features we deferred are recognized and produce warnings.
+Point out that the timeout override is under `upstream.timeout`. All feature settings are typed and validated at startup.
 
 ### 3. Handle the request: [gateway.go](gateway.go)
 
 Start at `ServeHTTP`.
 
-> This shows the order of the checks. Health comes first. For other requests, I find the route, check the method and API key, check the rate limit, choose a backend, and forward the request.
+> This shows the order of the checks. Health comes first. For other requests, I find the route, check the method and API key, check the rate limit, prepare transformations and replay, choose an eligible backend, check the circuit, and forward the request.
 >
 > If a check fails, we return there. The request never reaches the backend.
 
@@ -69,7 +69,7 @@ Then show `match` and `forward`.
 
 > The most specific matching route wins. `/api/users` matches `/api/users/123`, but it doesn't match `/api/users-extra`.
 >
-> The forwarding code builds the backend URL, copies the request, and streams the response back. Streaming means we don't need to hold the entire body in memory.
+> The forwarding code builds the backend URL, copies the request, and streams the response back. Ordinary routes stream. JSON transformations and retryable uploads buffer at most 1 MiB.
 
 Two details worth explaining if asked:
 
@@ -95,6 +95,15 @@ Start at `allow`: it keeps the whole decision under one lock, makes the evaluati
 > The algorithm adds each backend's weight to its score, picks the highest score, and subtracts the total weight from the winner. That's how it keeps the configured ratio without creating a list of repeated backend entries.
 
 The lock only protects those scores. Requests to different backends can still run at the same time.
+
+### 6. Follow-up features
+
+- `transform.go` maps JSON and applies the final response envelope, with input/output bounds and protected headers.
+- `health.go` starts probes after the server binds, excludes unhealthy targets, restores recovered targets, and joins workers on shutdown.
+- `circuitbreaker.go` keeps route state under a lock. One probe tests recovery; late results cannot overwrite newer state.
+- `retry.go` prepares replay bytes once, closes discarded responses, and keeps attempts/backoff inside one deadline.
+
+Run `./scripts/demo-features.sh` for these features. The combined tests use all four on the same route and prove that retries count once for quota and breaker state.
 
 ## Explain the testing and review
 
@@ -125,13 +134,13 @@ The full results are in [REVIEW.md](REVIEW.md).
 
 > Each file has a clear job. The handler coordinates the request. The limiter owns its counts, and the balancer owns its selection state. I used the existing HTTP transport interface rather than adding a custom framework.
 
-**Deferring retries**
+**Keeping retries safe**
 
-> A failed connection doesn't tell us whether a POST already changed something. Retrying could create the same order twice. I'd define which requests are safe to repeat before adding retries.
+> A failed connection doesn't tell us whether a POST already changed something. Gateway retries only apply to idempotent methods, within one shared deadline. POST/PATCH receive one gateway attempt. The standard transport's own recovery behavior is documented separately.
 
-**Accepting unsupported settings**
+**Finishing the configuration carefully**
 
-> The supplied config includes all the stretch features. I let it start with explicit warnings so the implemented routes still work. The README makes the missing behavior clear.
+> The core baseline warned about deferred features. The follow-up implements them with explicit rules for body limits, failed backends, circuit recovery and safe replay. Invalid settings now fail startup.
 
 **Running multiple gateway instances**
 
@@ -143,7 +152,7 @@ The full results are in [REVIEW.md](REVIEW.md).
 
 **What I'd do next**
 
-> I'd add transformations with clear rules for invalid JSON and body-size limits, then safe retries. Before production use, I'd add traffic metrics and load tests to establish the operating limits.
+> Before production use, I'd add traffic metrics, a trusted-proxy policy and load tests to establish the operating limits.
 
 **Using AI**
 

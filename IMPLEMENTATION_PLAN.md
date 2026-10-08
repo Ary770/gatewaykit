@@ -1,7 +1,7 @@
 # Follow-up feature implementation
 
-The original core submission is preserved at tag `core-submission-2026-10-08`
-(commit `0f3b250`). This work extends it after the original time-box.
+The original core baseline is preserved at tag `core-submission-2026-10-08`
+(commit `0f3b250`). This work extends it after the core baseline.
 
 ## Design and integration order
 
@@ -33,7 +33,7 @@ the existing path, auth, rate-limit, streaming, cancellation, and deadline rules
    statuses and transport failures represented as 502/504. Use fixed/exponential
    backoff bounded by one request deadline; close discarded response bodies.
    Automatic retries are limited to GET, HEAD, OPTIONS, TRACE, PUT and DELETE;
-   POST/PATCH are never automatically replayed, even with Idempotency-Key.
+   POST/PATCH never receive gateway-managed retries, even with Idempotency-Key.
    Buffer retryable request bodies
    within 1 MiB before sending, and never retry after a response starts. Select
    an eligible target on each attempt. One quota charge and breaker outcome per
@@ -56,7 +56,7 @@ the existing path, auth, rate-limit, streaming, cancellation, and deadline rules
   or oversized upstream JSON is 502. Ordinary untransformed routes still stream.
 - Retry buffering above 1 MiB returns 413 before any attempt. Retry-disabled and
   unsafe-method requests retain streaming. attempts bounds application-level
-  RoundTrip calls; Go's transport may internally recover an unused connection.
+  RoundTrip calls; Go's transport may internally retry requests it considers replayable; this is not an exactly-once delivery guarantee.
 - Breaker success is a completed non-5xx response; truncated upstream bodies are
   failures. Local preparation/no-target errors and client cancellation are neutral.
   Every permit is completed, including neutral half-open release; failure storage
@@ -90,8 +90,8 @@ Land each feature separately; no concurrent edits to the integration checkout.
 
 ## Completion
 
-- [ ] Transformations
-- [ ] Active health checks
-- [ ] Circuit breakers
-- [ ] Retries/backoff
-- [ ] Combined-feature tests, demo, final docs and sequential push
+- [x] Transformations
+- [x] Active health checks
+- [x] Circuit breakers
+- [x] Retries/backoff
+- [x] Combined-feature tests, demo, final docs and sequential push

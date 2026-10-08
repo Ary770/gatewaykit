@@ -73,7 +73,7 @@ This builds and starts the real application and mock upstreams, asserts response
 | Active upstream health checks | Implemented (follow-up) |
 | Circuit breaker | Implemented (follow-up) |
 
-The original core submission is preserved at tag `core-submission-2026-10-08`. The four additional features were implemented as follow-up work, with explicit safety boundaries below.
+The original core baseline is preserved at tag `core-submission-2026-10-08`. The four additional features were implemented as follow-up work, with explicit safety boundaries below.
 
 ## Defined behavior
 

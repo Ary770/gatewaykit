@@ -108,5 +108,31 @@ curl -i http://localhost:8080/api/users
 curl -i http://localhost:8080/api/internal -H 'X-API-Key: sk_live_abc123'
 ```
 
-Expected: startup warnings identify each omitted feature; the gateway still starts on 8080 and forwards these requests. The key is the example value from the requirements, not a real credential. Be explicit that `/api/legacy` is not transformed and that circuit breakers/active health checking/retries are not active.
+Expected: the supplied configuration starts on 8080 without deferred-feature warnings. The key is an illustrative value from the requirements, not a real credential. `/api/legacy` now applies transformations, `/api/products` runs health checks, `/api/orders` uses safe retries, and `/api/internal` has a circuit breaker. See the README for precise boundaries.
 
+## Follow-up features: transformations, retries, health checks, circuit breaker
+
+After integrating the follow-up features, run:
+
+```sh
+./scripts/demo-features.sh
+```
+
+This uses `examples/features.yaml`, a gateway on **18080**, and two separate mock
+processes on **13001** and **13002**. These ports must be free; the core 8080
+demo can remain running. The script builds the binaries and stops only its own
+processes when finished. It requires Go, Bash, curl, and ordinary shell utilities.
+
+The assertions show:
+
+1. A POST body with `userId` and `userName` becomes a nested `user` object, removes
+   a request header, adds a gateway header, and wraps the response in an envelope.
+2. A GET starts at a backend configured to return 503, retries once, and succeeds
+   at the second backend. The final response identifies that backend.
+3. The script stops its second mock and waits for a health-check transition;
+   subsequent requests all reach the remaining healthy backend.
+4. Two upstream 503 responses open a circuit. The third request receives the
+   gateway's `service_unavailable` JSON, `retry_after`, and `Retry-After` header.
+
+Each feature has its own route so the demonstrated cause and effect is clear.
+This is a live smoke demo; unit and integration tests cover additional boundaries.

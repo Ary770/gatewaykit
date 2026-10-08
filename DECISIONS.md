@@ -2,7 +2,7 @@
 
 ## Scope and priorities
 
-The original two-hour submission is preserved at tag `core-submission-2026-10-08`. It prioritized real HTTP proxying, timeouts, authentication, rate limiting and balancing. Follow-up work has added all four features: transformations, active health checks, circuit breakers and safe gateway-managed retries.
+The original core baseline is preserved at tag `core-submission-2026-10-08`. It prioritized real HTTP proxying, timeouts, authentication, rate limiting and balancing. Follow-up work has added all four features: transformations, active health checks, circuit breakers and safe gateway-managed retries.
 
 ## Implementation plan
 
@@ -24,7 +24,7 @@ The pipeline is liveness -> route/method -> authentication -> rate limit -> requ
 
 The standard HTTP transport supplies connection pooling, HTTP framing, and cancellation, but it does not route or copy requests/responses for us. We explicitly build the upstream URL, remove hop-by-hop headers, replace untrusted forwarding headers, forward the body, copy response status/headers, and stream the response. We use `RoundTrip` so redirects are returned rather than followed and disable automatic decompression to preserve representations.
 
-Bodies are streamed to avoid a memory cost proportional to payload size. A timeout before headers can become a clean 504; after headers are sent, changing the status is impossible, so an interrupted body terminates the downstream exchange. WebSockets, protocol upgrades, and trailers are outside this submission.
+Bodies stream unless JSON rewriting or retry replay requires a bounded buffer. A timeout before headers can become a clean 504; after headers are sent, changing the status is impossible, so an interrupted body terminates the downstream exchange. WebSockets, protocol upgrades, and trailers are outside this submission.
 
 ## Ambiguities resolved
 
@@ -34,13 +34,13 @@ Bodies are streamed to avoid a memory cost proportional to payload size. A timeo
 - A global rate limit is a default copied to each route, following the example's "unless overridden" comment. `per: global` means all clients of that route, not all routes together.
 - Fixed windows start on first accepted request. Sliding windows use exact timestamp histories. Both exclude rejected requests.
 - Socket IP is the identity. Trusting arbitrary `X-Forwarded-For` would let a client evade limits. Trusted proxy configuration would be a separate feature.
-- The original submission warned about deferred features. The follow-up uses typed, strictly validated configuration for every supplied feature; malformed fields now fail startup.
+- The original core baseline warned about deferred features. The follow-up uses typed, strictly validated configuration for every supplied feature; malformed fields now fail startup.
 
 ## Why these features came first
 
 The baseline proxy, error behavior, and configurable routes establish one end-to-end slice. Authentication and rate limiting exercise security boundaries and concurrent state. Weighted balancing completes the supplied multi-target route without introducing retry safety issues. Both limiter algorithms fit within the implementation budget and have deterministic boundary tests.
 
-Retries were deferred because retrying POST/PUT requests can duplicate side effects and requires deliberate replay/idempotency semantics. Transformations need explicit behavior for invalid JSON, missing paths, non-JSON responses, and body-size limits. Active health checking now has an explicit lifecycle: run starts probes after binding and joins them on every exit. Each route target tracks health independently; network I/O happens outside balancing locks, and state transitions reset scheduling credit. Circuit breakers require a defined failure classification and synchronized half-open probes. These should each be implemented and tested completely rather than partially advertised.
+Retries were deferred because retrying POST/PUT requests can duplicate side effects and requires deliberate replay/idempotency semantics. Transformations needed explicit behavior for invalid JSON, missing paths, non-JSON responses, and body-size limits. Active health checking now has an explicit lifecycle: run starts probes after binding and joins them on every exit. Each route target tracks health independently; network I/O happens outside balancing locks, and state transitions reset scheduling credit. Circuit breakers needed a defined failure classification and synchronized half-open probes. The follow-up implements and tests these contracts explicitly.
 
 ## Trade-offs and next steps
 
@@ -60,11 +60,11 @@ A clean ZIP extraction subsequently exposed a timing-dependent 502/504 classific
 
 ## Follow-up: transformations
 
-After the original time-box, request mapping and response envelopes were added
+After the core baseline, request mapping and response envelopes were added
 with typed configuration and startup validation. The original core remains tagged.
 The implementation supports the supplied expressions directly rather than adding
 an expression engine. Body transforms buffer at most 1 MiB of input and reject
-output above that limit; all other forwarding remains streamed. Missing mapped
+output above that limit; routes without replay or transformation remain streamed. Missing mapped
 fields become null, arrays are values rather than indexed paths, and conflicting
 destinations fail startup. Representation metadata is rebuilt after body changes.
 Health checks, circuit breakers and retries were integrated in subsequent follow-up commits.
@@ -96,5 +96,4 @@ exercise real connection failures, cancellation, recovery and stalled uploads.
 Workers used isolated worktrees for transformations, health checks and breaker
 state; an integration owner reviewed and landed each independently, owned retries,
 and ran the combined race suite and executable demos. The original tagged
-submission remains available for comparison; the follow-up is not represented as
-work completed during the original two-hour baseline.
+submission remains available for comparison; the Git history records when each phase was completed.
