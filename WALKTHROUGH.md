@@ -67,6 +67,8 @@ Start at `ServeHTTP`.
 
 Then show `match` and `forward`.
 
+`forward` reads in three stages: clone and sanitize the outgoing request, prepare transformations and retry replay, then run the backend exchange. The shared deadline surrounds all three stages. `forwardPreparedRequest` keeps circuit-breaker accounting around the full exchange, including response streaming, so a broken backend response and a disconnected client are classified differently.
+
 > The most specific matching route wins. `/api/users` matches `/api/users/123`, but it doesn't match `/api/users-extra`.
 >
 > The forwarding code builds the backend URL, copies the request, and streams the response back. Ordinary routes stream. JSON transformations and retryable uploads buffer at most 1 MiB.
@@ -168,3 +170,16 @@ The full results are in [REVIEW.md](REVIEW.md).
 - `http.RoundTripper` is the standard interface that performs an HTTP exchange.
 
 You don't need to explain every syntax detail up front. Start with what the request does, then use the code to show how it works.
+
+## Architecture in one minute
+
+- `main.go` starts and stops the server and health workers.
+- `config.go` turns YAML into validated settings.
+- `gateway.go` follows one request from route checks to the backend and back.
+- `ratelimit.go`, `balancer.go`, and `circuitbreaker.go` own their separate state and locks.
+- `retry.go` owns attempts and backoff under the original deadline.
+- `transform.go` owns header and bounded JSON changes.
+- `health.go` starts one worker per configured backend. Each worker probes, updates health after the configured failure threshold, and waits until its next check. Shutdown cancels and joins every worker.
+- `demo/run.py` builds and starts the browser demo; `demo/web/index.html` sends real requests through the gateway.
+
+There is no plugin framework or middleware registry to explain. The gateway calls these functions directly, and each policy stays in its own file.

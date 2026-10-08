@@ -67,12 +67,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	r, allowed := g.match(req.URL.Path, req.Method)
 	if r == nil {
-		if len(allowed) > 0 {
-			w.Header().Set("Allow", strings.Join(allowed, ", "))
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
-		} else {
-			writeError(w, http.StatusNotFound, "not_found")
-		}
+		writeRouteRejection(w, allowed)
 		return
 	}
 	deadline := setClientDeadlines(w, r.timeout)
@@ -85,6 +80,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	g.forward(w, req, r, deadline)
+}
+
+func writeRouteRejection(w http.ResponseWriter, allowedMethods []string) {
+	if len(allowedMethods) == 0 {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 }
 
 func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Request, limiter *rateLimiter) bool {
@@ -131,6 +135,16 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, deadline time.Time) {
 	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	defer cancel()
+	out := cloneUpstreamRequest(req, ctx)
+	values := transformValues{requestTime: g.now().UTC().Format(time.RFC3339Nano), route: r.config.Path}
+	attempts, ready := g.prepareUpstreamRequest(w, out, r, values, deadline)
+	if !ready {
+		return
+	}
+	g.forwardPreparedRequest(w, req, out, r, values, attempts, deadline)
+}
+
+func cloneUpstreamRequest(req *http.Request, ctx context.Context) *http.Request {
 	out := req.Clone(ctx)
 	out.RequestURI = ""
 	out.Close = false
@@ -150,14 +164,17 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, de
 		proto = "https"
 	}
 	out.Header.Set("X-Forwarded-Proto", proto)
-	values := transformValues{requestTime: g.now().UTC().Format(time.RFC3339Nano), route: r.config.Path}
+	return out
+}
+
+func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Request, r *route, values transformValues, deadline time.Time) (int, bool) {
 	if status, err := g.transformRequest(out, r, values); err != nil {
-		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if !time.Now().Before(deadline) || errors.Is(out.Context().Err(), context.DeadlineExceeded) {
 			status = http.StatusGatewayTimeout
 			w.Header().Set("Connection", "close")
 		}
 		writeError(w, status, "request_transform_failed")
-		return
+		return 0, false
 	}
 	attempts, err := prepareRetry(out, r.config.Retry)
 	if err != nil {
@@ -165,13 +182,19 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, de
 		if errors.Is(err, errReplayBodyTooLarge) {
 			status, message = http.StatusRequestEntityTooLarge, "retry_body_too_large"
 		}
-		if upstreamErrorStatus(err, ctx) == http.StatusGatewayTimeout {
+		if upstreamErrorStatus(err, out.Context()) == http.StatusGatewayTimeout {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
 			w.Header().Set("Connection", "close")
 		}
 		writeError(w, status, message)
-		return
+		return 0, false
 	}
+	return attempts, true
+}
+
+// Keep breaker accounting around the complete exchange, including streaming.
+// Client upload failures and canceled requests must not count as backend failures.
+func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.Request, r *route, values transformValues, attempts int, deadline time.Time) {
 	target := r.balancer.next()
 	if target == nil {
 		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
@@ -206,7 +229,7 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, de
 		status, message := http.StatusBadGateway, "bad_gateway"
 		// A downstream read deadline can cancel the parent context before the
 		// context timer reports DeadlineExceeded. The shared deadline is authoritative.
-		if upstreamErrorStatus(err, ctx) == http.StatusGatewayTimeout {
+		if upstreamErrorStatus(err, out.Context()) == http.StatusGatewayTimeout {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
 			// A read timeout cancels net/http's connection context permanently.
 			// Close it so the next request starts on a healthy connection.
@@ -230,7 +253,7 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, de
 			outcome = breakerFailure
 		}
 		status := http.StatusBadGateway
-		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if !time.Now().Before(deadline) || errors.Is(out.Context().Err(), context.DeadlineExceeded) {
 			status = http.StatusGatewayTimeout
 			w.Header().Set("Connection", "close")
 		}

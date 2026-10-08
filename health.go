@@ -42,52 +42,76 @@ func (g *Gateway) startHealthChecks(parent context.Context) func() {
 		}
 		for index := range r.balancer.backends {
 			workers.Add(1)
-			go func(r *route, index int, target *url.URL) {
+			go func(selectedRoute *route, backendIndex int) {
 				defer workers.Done()
-				c := r.config.HealthCheck
-				interval, _ := duration(c.Interval)
-				timeout := min(r.timeout, interval, 5*time.Second)
-				endpoint := *target
-				path, _ := url.Parse(c.Path)
-				endpoint.Path, endpoint.RawPath, endpoint.RawQuery = path.Path, path.RawPath, path.RawQuery
-				endpoint.ForceQuery = path.ForceQuery
-				failures := 0
-				for {
-					if ctx.Err() != nil {
-						return
-					}
-					probeCtx, stop := context.WithTimeout(ctx, timeout)
-					req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint.String(), nil)
-					// RoundTrip does not follow redirects; header receipt defines probe success.
-					response, err := g.transport.RoundTrip(req)
-					healthy := err == nil && response.StatusCode >= 200 && response.StatusCode < 400
-					if response != nil && response.Body != nil {
-						response.Body.Close()
-					}
-					stop()
-					if ctx.Err() != nil {
-						return
-					}
-					if healthy {
-						failures = 0
-					} else if failures < c.UnhealthyThreshold {
-						failures++
-					}
-					if healthy || failures >= c.UnhealthyThreshold {
-						if r.balancer.setHealthy(index, healthy) {
-							slog.Info("upstream health changed", "route", r.config.Path, "target", target.Host, "healthy", healthy)
-						}
-					}
-					timer := time.NewTimer(interval)
-					select {
-					case <-ctx.Done():
-						timer.Stop()
-						return
-					case <-timer.C:
-					}
-				}
-			}(r, index, r.balancer.backends[index].url)
+				g.monitorBackend(ctx, selectedRoute, backendIndex)
+			}(r, index)
 		}
 	}
 	return func() { cancel(); workers.Wait() }
+}
+
+func (g *Gateway) monitorBackend(ctx context.Context, selectedRoute *route, backendIndex int) {
+	policy := selectedRoute.config.HealthCheck
+	interval, _ := duration(policy.Interval)
+	timeout := min(selectedRoute.timeout, interval, 5*time.Second)
+	target := selectedRoute.balancer.backends[backendIndex].url
+	endpoint := healthProbeURL(target, policy.Path)
+	consecutiveFailures := 0
+	for ctx.Err() == nil {
+		healthy := g.probeBackend(ctx, endpoint, timeout)
+		if ctx.Err() != nil {
+			return
+		}
+		if healthy {
+			consecutiveFailures = 0
+		} else if consecutiveFailures < policy.UnhealthyThreshold {
+			consecutiveFailures++
+		}
+		if healthy || consecutiveFailures >= policy.UnhealthyThreshold {
+			updateBackendHealth(selectedRoute, backendIndex, healthy)
+		}
+		if !waitForHealthInterval(ctx, interval) {
+			return
+		}
+	}
+}
+
+func healthProbeURL(target *url.URL, path string) *url.URL {
+	endpoint := *target
+	probePath, _ := url.Parse(path)
+	endpoint.Path, endpoint.RawPath, endpoint.RawQuery = probePath.Path, probePath.RawPath, probePath.RawQuery
+	endpoint.ForceQuery = probePath.ForceQuery
+	return &endpoint
+}
+
+func (g *Gateway) probeBackend(parent context.Context, endpoint *url.URL, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	// RoundTrip does not follow redirects; header receipt defines probe success.
+	response, err := g.transport.RoundTrip(request)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	return err == nil && response.StatusCode >= 200 && response.StatusCode < 400
+}
+
+func updateBackendHealth(selectedRoute *route, backendIndex int, healthy bool) {
+	if !selectedRoute.balancer.setHealthy(backendIndex, healthy) {
+		return
+	}
+	target := selectedRoute.balancer.backends[backendIndex].url
+	slog.Info("upstream health changed", "route", selectedRoute.config.Path, "target", target.Host, "healthy", healthy)
+}
+
+func waitForHealthInterval(ctx context.Context, interval time.Duration) bool {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
