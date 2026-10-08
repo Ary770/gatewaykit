@@ -1,213 +1,159 @@
-# Presenting GatewayKit
+# GatewayKit walkthrough
 
-## The 30-minute walkthrough
+Use this as speaking notes. Start with the overview, show the demo, then follow one request through the code. The commands and expected responses are in [DEMO.md](DEMO.md).
 
-| Time | What to show | Main point |
-|---|---|---|
-| 0–3 min | Scope and feature table in README | A complete baseline plus tested stateful features; stretch features are explicitly omitted. |
-| 3–10 min | Live demo | Requests really travel through the gateway, and failures have predictable results. |
-| 10–20 min | Code in request order | Configuration becomes immutable routing data; isolated components own concurrent state. |
-| 20–25 min | Focused tests | Show correctness at boundaries and under concurrent requests. |
-| 25–30 min | Decisions and questions | Explain trade-offs, limitations, and what you would implement next. |
+## How I'd introduce it
 
-Opening explanation, in your own words:
+> I built a small API gateway that reads its routes and settings from YAML. It checks the request, chooses a backend, and forwards it.
+>
+> I started with routing and basic proxying. Then I added timeouts, API-key checks, rate limits, and weighted load balancing. I focused on making those work correctly, including when requests arrive together or a backend fails.
+>
+> Retries, transformations, health checks, and circuit breakers are still deferred. The app warns when they're configured, and the README lists what's implemented.
 
-> GatewayKit reads a YAML file, selects a route for each request, applies authentication and rate limits, chooses a backend, and forwards the request. I prioritized the core HTTP contract and failure behavior, then added rate limiting and weighted balancing because they let me demonstrate safe concurrent state. I left retries, transformations, health checks, and circuit breakers out rather than implement their edge cases incompletely.
+## What I'd show in 30 minutes
 
-## Demo: automated proof
+| Time | What to cover |
+|---|---|
+| First 3 minutes | What it does and what I prioritized |
+| Next 7 minutes | The live demo |
+| Next 10 minutes | Follow a request through the code |
+| Last 10 minutes | Tests, review fixes, trade-offs, and questions |
 
-From the repository root:
+## Start with the demo
 
 ```sh
 ./scripts/demo.sh
 ```
 
-This starts the real binaries, checks every expected status, checks weighted distribution, and stops its own processes. Run this once before the interview to catch port conflicts. It requires ports 8081 and 3001–3006 to be free.
+> This starts the gateway and mock backends, sends requests, checks the results, and stops the processes when it's done. The demo uses different routes and settings from the supplied config.
 
-## Demo: present each behavior yourself
+The main things to point out:
 
-Terminal 1:
+- The backend receives the request body and query string. Prefix stripping changes `/echo/hello` to `/hello`.
+- An unknown route returns `404`. A method that isn't allowed returns `405`.
+- A missing API key returns `401`. The configured key lets the request through.
+- The limited route accepts three requests and rejects the fourth with `429` and `Retry-After`.
+- With weights of 3 and 1, eight requests split six to one backend and two to the other.
+- A slow backend returns `504`. An unreachable backend returns `502`.
+- `/health` tells us the gateway is running. It still returns `200` when backends are down.
 
-```sh
-go run ./cmd/mock
-```
+Use [DEMO.md](DEMO.md) to run these individually. Start a fresh gateway before demonstrating the rate limit so earlier requests don't affect the count.
 
-Terminal 2:
+## Follow one request through the code
 
-```sh
-go run . -config examples/demo.yaml
-```
+### 1. Start the app: [main.go](main.go)
 
-Terminal 3 runs the requests below. Start a fresh gateway before the rate-limit section so prior demo requests do not consume its quota.
+> This is the startup and shutdown code. It gets the config path, validates the file, creates the HTTP transport, and starts listening.
+>
+> I reuse one transport so requests can reuse backend connections. When the app stops, it gives active requests up to five seconds to finish.
 
-### 1. Health
+A transport sends the HTTP request. Our code still decides where to send it and how to forward the response.
 
-```sh
-curl -i http://localhost:8081/health
-```
+### 2. Read the settings: [config.go](config.go)
 
-Expected: 200, `status: healthy`, integer uptime. Explain that this reports process liveness and bypasses upstreams and policies.
+> I validate the config before accepting traffic. Bad URLs, invalid durations, conflicting routes, or missing auth settings fail at startup with an error.
+>
+> Defaults are resolved once. Each request uses the settings we've already loaded.
 
-### 2. Forwarding, prefix stripping, and body preservation
+Point out that the timeout override is under `upstream.timeout`. Features we deferred are recognized and produce warnings.
 
-```sh
-curl -i 'http://localhost:8081/echo/hello?name=Ada' \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"hello"}'
-```
+### 3. Handle the request: [gateway.go](gateway.go)
 
-Expected: 200. The backend reports `/hello`, query `name=Ada`, method POST, and the original body. `/echo` was removed by configuration. Point out that the demo has entirely different routes from the supplied example.
+Start at `ServeHTTP`.
 
-### 3. Routing errors
+> This shows the order of the checks. Health comes first. For other requests, I find the route, check the method and API key, check the rate limit, choose a backend, and forward the request.
+>
+> If a check fails, we return there. The request never reaches the backend.
 
-```sh
-curl -i http://localhost:8081/missing
-curl -i -X POST http://localhost:8081/products
-```
+Then show `match` and `forward`.
 
-Expected: 404, then 405 with `Allow: GET`. A path match and a method match are separate decisions.
+> The most specific matching route wins. `/api/users` matches `/api/users/123`, but it doesn't match `/api/users-extra`.
+>
+> The forwarding code builds the backend URL, copies the request, and streams the response back. Streaming means we don't need to hold the entire body in memory.
 
-### 4. Authentication
+Two details worth explaining if asked:
 
-```sh
-curl -i http://localhost:8081/private
-curl -i http://localhost:8081/private -H 'X-API-Key: demo-key'
-```
+- Some headers only apply to one connection, such as `Connection` and `Keep-Alive`. We remove those before forwarding. We also remove any extra headers named by `Connection`.
+- The backend request and the client socket use a shared deadline. That covers a slow backend, an unfinished upload, and a client that stops reading. Writes get one extra second to allow a timeout response. If a response has already started, a later failure closes it because we can't change the status anymore.
 
-Expected: 401, then 200 from backend 3002. Authentication happens before rate limiting and forwarding.
+### 4. Count requests safely: [ratelimit.go](ratelimit.go)
 
-### 5. Rate limiting
+> Each route owns its request counts. A lock keeps the quota check and count update together, so simultaneous requests can't all claim the last available slot. We release the lock before contacting the backend.
+>
+> Fixed windows count requests from the start of a window. Sliding windows keep the accepted request times and remove the ones that are too old.
 
-```sh
-for i in 1 2 3 4; do
-  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8081/limited
-done
-curl -i http://localhost:8081/limited
-```
+`per: ip` uses the client's connection address. `per: global` shares one count across all clients of that route. The gateway-level policy supplies the default for each route; a route override replaces it.
 
-Expected: 200, 200, 200, 429; the final response includes `Retry-After`. Wait ten seconds from the first accepted request and try again: it returns 200. The automated tests use a controlled clock, so their boundary assertions do not sleep.
+> I don't trust a client-supplied IP header. Otherwise someone could change the header on every request to avoid the limit.
 
-### 6. Weighted balancing
+### 5. Choose a backend: [balancer.go](balancer.go)
 
-```sh
-for i in 1 2 3 4 5 6 7 8; do
-  curl -s -D - -o /dev/null http://localhost:8081/products/123 | grep -i x-mock-upstream
-done
-```
+> Equal weights take turns. Different weights change the share of requests each backend receives.
+>
+> The algorithm adds each backend's weight to its score, picks the highest score, and subtracts the total weight from the winner. That's how it keeps the configured ratio without creating a list of repeated backend entries.
 
-Expected: six requests to 3003 and two to 3004. The exact sequence is smooth rather than three requests to one backend followed by one to the other. The stripped upstream path is `/123`.
+The lock only protects those scores. Requests to different backends can still run at the same time.
 
-### 7. Timeout and upstream error handling
+## Explain the testing and review
 
-```sh
-curl -i 'http://localhost:8081/timeout/slow?delay=2s'
-curl -i 'http://localhost:8081/echo/error?status=503'
-```
+> The tests start their own HTTP servers, so they don't depend on manually running the mocks. They check paths, headers, bodies, errors, authentication, limits, and balancing.
+>
+> One concurrency test sends 50 requests against a limit of ten and checks that exactly ten get through. The limiter boundary tests use controlled times, so they don't need to wait for a window to expire.
 
-Expected: a 504 after roughly 100 milliseconds, then an unchanged upstream 503. No application-level retry is attempted.
+The review found issues worth talking about:
 
-To show an unreachable backend, stop the mock process in terminal 1, then request `/echo/hello`: expect 502. `/health` still returns 200. Restart the mocks if continuing.
+| Issue | What I changed |
+|---|---|
+| An encoded path could select a less protected route | Match the decoded path and reject ambiguous path forms before choosing a policy |
+| Concurrent requests could record timestamps out of order | Keep the limiter's effective time from moving backward while holding the lock |
+| A stalled upload could continue past the backend timeout | Add client-socket deadlines as well as the backend deadline |
+| Two timeout signals could race and produce `502` instead of `504` | Use one shared deadline to classify the failure consistently |
 
-### 8. The supplied configuration
+> I added regression tests for those cases. The final timeout check passed 100 repetitions locally and another 100 in the independent review. I also tested the extracted submission ZIP.
 
-Stop the demo gateway, then run:
+The full results are in [REVIEW.md](REVIEW.md).
 
-```sh
-go run . -config gateway.yaml
-curl -i http://localhost:8080/api/users
-curl -i http://localhost:8080/api/internal -H 'X-API-Key: sk_live_abc123'
-```
+## Decisions I'd be ready to explain
 
-Expected: startup warnings identify each omitted feature; the gateway still starts on 8080 and forwards these requests. The key is the example value from the requirements, not a real credential. Be explicit that `/api/legacy` is not transformed and that circuit breakers/active health checking/retries are not active.
+**Choosing Go**
 
-## Code tour, in execution order
+> Go's standard library covered the HTTP server, client transport, and testing tools I needed. YAML parsing is the only runtime dependency.
 
-### `main.go`: lifecycle
+**Keeping the design small**
 
-`main` creates a signal-cancelled context. `run` resolves a config path, loads and validates it, creates a reusable HTTP transport, opens the listener, and serves the gateway. On SIGINT/SIGTERM it waits for active requests to finish, up to five seconds, before force-closing.
+> Each file has a clear job. The handler coordinates the request. The limiter owns its counts, and the balancer owns its selection state. I used the existing HTTP transport interface rather than adding a custom framework.
 
-Why one transport? It reuses upstream connections. Creating a transport for every request would waste connections and prevent pooling. Why `RoundTrip`? It performs one HTTP exchange and does not automatically follow redirects like an HTTP client would.
+**Deferring retries**
 
-### `config.go`: parse once, validate once
+> A failed connection doesn't tell us whether a POST already changed something. Retrying could create the same order twice. I'd define which requests are safe to repeat before adding retries.
 
-Typed structs reflect the YAML schema. Supported values are validated before listening: methods, route conflicts, URLs, positive durations/limits, auth fields, and weights. Defaults are filled once. The runtime does not repeatedly parse durations or URLs.
+**Accepting unsupported settings**
 
-The deferred fields are stored as YAML nodes so they can be recognized and warned about without pretending to implement their schema or behavior. Unknown top-level and supported-struct fields fail parsing, which catches typos.
+> The supplied config includes all the stretch features. I let it start with explicit warnings so the implemented routes still work. The README makes the missing behavior clear.
 
-### `gateway.go`: request flow and HTTP semantics
+**Running multiple gateway instances**
 
-`newGateway` builds route objects and sorts them by descending prefix length. Each route receives its effective limiter and backend selector.
+> Counts are local to one process. Shared limits would need shared storage and a decision about what happens if that storage is unavailable.
 
-`ServeHTTP` handles health first, then finds a route, verifies method and key, checks quota, chooses an upstream, and calls `forward`. Every failure returns immediately, so rejected requests cannot reach a backend.
+**Running behind another proxy**
 
-`match` uses the decoded path, requires a segment boundary, and prioritizes the most specific path. Ambiguous separators and dot segments are rejected before policy selection, preventing encoded paths from selecting weaker authentication rules. `upstreamURL` joins the configured backend base path to the incoming suffix while preserving encoded characters and the raw query string.
+> We'd see the proxy's connection address. We'd need a trusted-proxy policy before using a forwarded client IP.
 
-`forward` creates a deadline-bound request clone, clears the server-only `RequestURI`, sets the backend URL/host, cleans headers, and executes it. It copies status and response headers and streams the body. It closes the response body and cancels the context on every exit. Separate downstream socket deadlines bound stalled uploads and clients that stop reading; an upstream context alone cannot stop a blocked downstream operation.
+**What I'd do next**
 
-Hop-by-hop headers apply only to one connection. Copying them through a gateway would incorrectly apply downstream connection instructions to the upstream connection. The `Connection` header can name additional hop-by-hop fields, so deleting only a fixed header list is insufficient.
+> I'd add transformations with clear rules for invalid JSON and body-size limits, then safe retries. Before production use, I'd add traffic metrics and load tests to establish the operating limits.
 
-Headers cannot be changed after a response begins. If a streamed body fails after that point, the gateway terminates the response rather than pretending it succeeded.
+**Using AI**
 
-### `ratelimit.go`: concurrent quota ownership
+> I used AI to help with the plan, implementation, tests, and review. I checked the result against the supplied config and exercised the running app. The review found bugs, and the regression tests helped verify the fixes.
 
-A route's limiter owns a mutex and a map from identity to bucket. Checking and incrementing happen inside the same critical section; otherwise concurrent requests could all observe spare quota and exceed the limit.
+## Quick Go reference
 
-For fixed windows, each bucket stores a start time and accepted-request count. For sliding windows, it stores accepted timestamps and removes timestamps at or before `now - window`. A full sliding bucket tells the client to retry when its oldest accepted request expires. Evaluation time is clamped monotonically under the lock because callers can capture a timestamp and then acquire the mutex out of order.
+- `struct` groups related data. `*Gateway` is a pointer to the shared gateway instance.
+- `defer` runs cleanup when the function returns, including on error paths.
+- `go func()` starts concurrent work. Channels and `select` coordinate completion and cancellation.
+- `sync.Mutex` protects shared state while it is checked and updated.
+- `context.Context` carries cancellation and deadlines into the backend request.
+- `http.RoundTripper` is the standard interface that performs an HTTP exchange.
 
-IP identity comes from the TCP peer. `per: global` replaces the identity with one constant key. Expired buckets are swept lazily, and the identity cap prevents unlimited map growth. The implementation uses in-process state, so it deliberately does not enforce a shared quota across multiple replicas.
-
-### `balancer.go`: smooth weighted selection
-
-Each backend has a configured weight and a current score. For each selection:
-
-1. Add every backend's weight to its current score.
-2. Select the highest score.
-3. Subtract the sum of all weights from the selected backend.
-
-Equal weights produce round robin. Weights 3:1 produce a 3:1 distribution without constructing a list containing repeated backend entries. The lock protects scores only; the HTTP request happens after releasing it.
-
-### Tests and mock command
-
-`gateway_test.go` sends real HTTP requests to `httptest` upstreams and verifies the proxy contract. `ratelimit_test.go` uses explicit times for boundary tests and launches 50 concurrent requests to prove exactly ten are accepted under a ten-request limit. `balancer_test.go` checks distribution concurrently. `main_test.go` verifies startup configuration, occupied-port errors, and graceful draining.
-
-`cmd/mock` is a demonstration tool, not a runtime dependency. It echoes request details, supports delayed responses and chosen statuses, and binds only to loopback.
-
-## Questions you should be ready to answer
-
-**Why Go?** The standard library has the HTTP primitives, concurrency support, and self-contained server testing needed for this scope. Only YAML parsing required a dependency.
-
-**Why no proxy helper?** The exercise explicitly asks us to build forwarding logic. The code uses a transport for the underlying HTTP exchange, not an existing reverse-proxy implementation.
-
-**What does global rate limit mean?** It supplies each route's default policy. Within a route, `per: global` means one bucket for all clients. This interpretation follows the configuration comment and is documented rather than implicit.
-
-**Why stream bodies?** Buffering arbitrary bodies makes memory proportional to payload size. Streaming keeps ordinary proxying inexpensive, at the cost of not being able to rewrite a response after its headers are sent.
-
-**Why defer retries?** A network failure does not prove a POST failed to execute. Retrying can duplicate side effects. Safe retries need body replay limits, request idempotency rules, and a shared timeout budget.
-
-**Why accept unsupported settings?** The provided YAML contains all stretch features, so rejecting them would prevent the mandatory baseline from starting. Explicit warnings and a feature table disclose the reduced behavior. A production product should offer strict capability validation.
-
-**What happens with multiple gateway instances?** Each has independent counters and balancing state. Shared quotas would require a centralized store and atomic operations, plus a policy for store outages.
-
-**What changes behind a load balancer?** Socket IP becomes the load balancer's IP. A trusted-proxy policy is needed before using forwarded client identity; trusting arbitrary headers would allow limit evasion.
-
-**What would you build next?** Bounded transformations with explicit invalid-input behavior, then idempotency-aware retries, then recovery mechanisms. Before Internet-facing use, prove resource limits and observability under load.
-
-**How was AI used?** AI helped draft the plan, code, tests, and review. The output was checked against the source configuration and real runtime behavior. Explain the actual code and tests rather than claiming it was manually authored.
-
-## Before sending
-
-- Run `go test -race ./...`, `go vet ./...`, and `./scripts/demo.sh`.
-- Read `REVIEW.md` for final findings and remaining limitations.
-- Confirm `git status --short` is empty and recent commits tell the build story.
-- Confirm the ZIP contains `.git/` and can run from a fresh extracted directory.
-- Reply all to Jared's original email from `abaldioceda@gmail.com`, attaching the ZIP, before 4 p.m. Eastern. The original recipient list belongs to that email; do not invent or replace it.
-
-## Go syntax you will see in this code
-
-- `type ... struct` groups related state. A method such as `(g *Gateway) ServeHTTP` operates on that object's shared instance.
-- `defer` registers cleanup for every function exit: unlocking, canceling contexts, and closing bodies.
-- `go func()` starts a concurrent task. Channels and `select` coordinate server completion, cancellation, and shutdown.
-- `sync.Mutex` makes checking and updating shared state one indivisible operation. It is released before network I/O.
-- `context.Context` carries cancellation and deadlines through the upstream request. Socket deadlines separately bound downstream reads and writes.
-- `http.RoundTripper` is the standard-library interface used for the actual HTTP exchange. This keeps forwarding testable without creating a project-specific transport abstraction.
-- Go returns errors as values. Startup errors stop the process; request errors map to explicit HTTP responses or abort an already-started stream.
+You don't need to explain every syntax detail up front. Start with what the request does, then use the code to show how it works.
