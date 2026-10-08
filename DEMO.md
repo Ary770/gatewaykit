@@ -94,7 +94,7 @@ curl -i 'http://localhost:8080/timeout/slow?delay=2s'
 curl -i 'http://localhost:8080/echo/error?status=503'
 ```
 
-Expected: a 504 after roughly 100 milliseconds, then an unchanged upstream 503. No application-level retry is attempted.
+Expected: a 504 after roughly 100 milliseconds, then an unchanged upstream 503. These core-demo routes do not configure retries, so each makes one gateway attempt.
 
 To show an unreachable backend, stop the mock process in terminal 1, then request `/echo/hello`: expect 502. `/health` still returns 200. Restart the mocks if continuing.
 
@@ -112,7 +112,7 @@ Expected: the supplied configuration starts on 8080 without deferred-feature war
 
 ## Follow-up features: transformations, retries, health checks, circuit breaker
 
-After integrating the follow-up features, run:
+To exercise the implemented additional features, run:
 
 ```sh
 ./scripts/demo-features.sh
@@ -153,7 +153,7 @@ For a repeatable functional check that starts and stops its own services:
 python3 demo/run.py --check
 ```
 
-`demo/web/index.html` contains the browser controls; `demo/gateway.yaml` defines their routes. The page itself is served through GatewayKit: `/demo` forwards to the static server on 3099. Button clicks call the gateway on 8080, which forwards API requests to the mock backends. The Python launcher and test client are development tools, not gateway runtime dependencies.
+`demo/web/index.html` contains the browser controls and `demo/web/features.js` contains the four additional scenarios; `demo/gateway.yaml` defines their routes. The page itself is served through GatewayKit: `/demo` forwards to the static server on 3099. Button clicks call the gateway on 8080, which forwards API requests to the mock backends. The Python launcher and test client are development tools, not gateway runtime dependencies.
 
 The browser page also includes four additional-feature controls:
 

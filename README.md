@@ -47,6 +47,17 @@ go vet ./...
 
 ## Demo
 
+| Option | Command | What it shows |
+|---|---|---|
+| Interactive browser | `python3 demo/run.py` | Core behavior and all four additional features at http://127.0.0.1:8080/demo/index.html |
+| Automated browser scenarios | `python3 demo/run.py --check` | Starts services, checks 24 live scenarios, then stops them |
+| Core terminal demo | `./scripts/demo.sh` | Routing, auth, limits, balancing, and failures on 8080 |
+| Additional-feature terminal demo | `./scripts/demo-features.sh` | Transformations, retries, health exclusion, and circuit opening on separate ports |
+
+Run only one demo using 8080 at a time. The browser launcher requires Python 3; the gateway itself requires only Go and its YAML dependency.
+
+The core terminal demo:
+
 ```sh
 ./scripts/demo.sh
 ```
@@ -94,7 +105,7 @@ State is in-memory and local to one process; restart resets counters and balanci
 
 See [DECISIONS.md](DECISIONS.md) for prioritization, architectural trade-offs, and next steps.
 
-### Follow-up transformations
+### Transformations
 
 `request_transform.headers` and `response_transform.headers` support `add` and
 `remove`; framing and gateway-derived identity headers are protected. Header-only
@@ -112,9 +123,11 @@ Empty requests remain empty; HEAD, 204 and 304 responses retain bodyless semanti
 Rewritten bodies receive JSON content type and discard stale representation metadata,
 even when header rules specify those metadata fields.
 
+### Active health checks
+
 Active health checks use GET at the target origin plus the configured path, without following redirects. HTTP 2xx/3xx is healthy. Targets start eligible; `unhealthy_threshold` consecutive failures exclude them (default 1), and one successful check restores them. When all targets are excluded the route returns 503. Checks run immediately, then wait the configured interval after each result; timeout is the smallest of the route timeout, interval, and five seconds. Shutdown cancels and joins probes. `/health` remains gateway liveness only.
 
-### Follow-up retries
+### Retries
 
 `retry.attempts` is the total number of gateway attempts, including the first
 (1–100). `on` lists HTTP error statuses to retry; transport errors are classified

@@ -22,10 +22,14 @@ Use this as speaking notes. Start with the overview, show the demo, then follow 
 ## Start with the demo
 
 ```sh
-./scripts/demo.sh
+python3 demo/run.py
 ```
 
-> This starts the gateway and mock backends, sends requests, checks the results, and stops the processes when it's done. The demo uses different routes and settings from the supplied config.
+Open http://127.0.0.1:8080/demo/index.html and click **Run the main demo**. Then use the four **Additional features** buttons individually. The circuit-breaker example takes about seven seconds.
+
+> This starts the real gateway, the demo page server, and the mock backends. Each button sends real HTTP requests through the gateway and displays the response. The demo uses different routes and settings from the supplied config. Press Ctrl+C in the launcher terminal to stop it.
+
+For automated terminal demonstrations, use `./scripts/demo.sh` or `./scripts/demo-features.sh`; see DEMO.md for their ports and prerequisites.
 
 The main things to point out:
 

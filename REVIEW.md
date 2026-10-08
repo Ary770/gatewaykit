@@ -1,6 +1,19 @@
 # Final code and application review
 
-## THE VERDICT: SHIP
+## Current verification
+
+The final executable revision `cc3601d` was verified from a fresh submission ZIP extraction. All four additional features are implemented: transformations, retries, active health checks, and circuit breakers.
+
+- Full uncached race-tested suite: PASS; gateway coverage **94.7%**, mock coverage **87.5%**.
+- Static checks and module verification: PASS.
+- Selected timeout, concurrency, and combined-feature regressions: **20 repeated race-enabled runs passed**.
+- Original demo, feature demo, and browser functional suite: PASS; **24/24 live browser-demo checks**.
+- All four new browser controls passed in Chrome, including repeated clicks and circuit recovery.
+- The ZIP matched all tracked files and included the browser demo and full Git history.
+
+The sections below retain the earlier review history. Their historical timings, counts, and coverage apply to the revisions named there.
+
+## Review conclusion
 
 Confidence: high · Mode: General · Bar: two-hour take-home submission
 
@@ -16,15 +29,15 @@ Confidence: high · Mode: General · Bar: two-hour take-home submission
 
 **Quick wins completed:** categorized upstream failure logs without bodies/keys/query strings; bounded failing-test observations; demo logs printed on failed assertions; connection framing reset between downstream and upstream; patched Go toolchain pinned.
 
-**Deep work before production:** distributed quota policy, trusted-proxy identity, traffic metrics, load-tested operating limits, and complete contracts for the deliberately deferred features.
+**Deep work before production:** distributed quota policy, trusted-proxy identity, traffic metrics, load-tested operating limits, and end-to-end resource limits.
 
-**What was not verified:** distributed deployment, sustained load/resource ceilings, real external upstreams, TLS termination, and the omitted features. No claim is made about those behaviors. Dependency scanning is point-in-time evidence, not a guarantee against future advisories.
+**What was not verified:** distributed deployment, sustained load/resource ceilings, real external upstreams, TLS termination. No claim is made about those behaviors. Dependency scanning is point-in-time evidence, not a guarantee against future advisories.
 
 ## Review target and independence
 
 The first panel reviewed source at `d0ece7f` through six lenses: architecture, state/data modeling, security, code quality, performance, and operability. Review agents were read-only; the implementing agent owned all fixes and commits.
 
-The second full code reviewer and the second application reviewer inspected `a49fa17` after the corrections. They were separate from the implementing agent and independently ran checks. A clean-extraction check then exposed a rare 502/504 classification race. The focused correction at `d1f3fc6` shares one deadline between downstream sockets and the upstream context; the independent code reviewer inspected that final diff and passed 100 repeated timeout/failure regressions. Subsequent commits add documentation only.
+The second full code reviewer and the second application reviewer inspected `a49fa17` after the corrections. They were separate from the implementing agent and independently ran checks. A clean-extraction check then exposed a rare 502/504 classification race. The focused correction at `d1f3fc6` shares one deadline between downstream sockets and the upstream context; the independent code reviewer inspected that final diff and passed 100 repeated timeout/failure regressions. Later commits added the four feature implementations, readability improvements, and the browser demo; current verification is summarized above.
 
 Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.go`, `cmd/mock`, the corresponding tests, the example configurations, and the demo script. README, DECISIONS, and WALKTHROUGH were checked against application behavior.
 
@@ -42,7 +55,7 @@ Covered source: `main.go`, `config.go`, `gateway.go`, `ratelimit.go`, `balancer.
 | Upstream failures lacked target/category diagnostics; demo failures discarded logs | Sanitized route/target/category logging; print child-process logs on demo failure | Code review and live demo |
 | Installed Go 1.26.3 had standard-library advisories reported by the scanner | Pin Go 1.26.9 in the project; system-wide Go installation is unchanged | Fresh vulnerability scan: `No vulnerabilities found.` |
 
-## Verification results
+## Core-baseline verification results (historical)
 
 - `go test -race -cover ./...`: PASS. Gateway statement coverage **93.4%**; mock command **87.5%**.
 - `go vet ./...`: PASS.
@@ -73,6 +86,6 @@ The independent review found no behavior changes or remaining readability issue 
 
 ## Accepted scope limitations
 
-Retries, transformations, active health checking, and circuit breakers emit warnings and do not run. Quotas and balancing are process-local. IP identity comes from the socket, not a trusted-proxy policy. There is no listener TLS, upgrade tunnel, trailer forwarding, configuration reload, or metrics endpoint. Route lookup is linear; exact sliding-window memory grows with accepted requests retained within a window, within the configured identity-table cap. Graceful shutdown drains for five seconds, which can be shorter than an active route timeout.
+Retries, transformations, active health checking, and circuit breakers are implemented with the boundaries described in README.md. Quotas and balancing are process-local. IP identity comes from the socket, not a trusted-proxy policy. There is no listener TLS, upgrade tunnel, trailer forwarding, configuration reload, or metrics endpoint. Route lookup is linear; exact sliding-window memory grows with accepted requests retained within a window, within the configured identity-table cap. Graceful shutdown drains for five seconds, which can be shorter than an active route timeout.
 
-These limitations are called out in the README and demo guide. The omitted features are not represented as complete or partially working.
+These limitations are called out in the README and demo guide. Unsupported capabilities are listed explicitly; implemented feature boundaries are documented in the README.
