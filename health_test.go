@@ -132,3 +132,86 @@ func TestHealthConcurrentBalancing(t *testing.T) {
 	}
 	waitHealth(t, g, false)
 }
+
+type healthRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f healthRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func awaitProbe(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("next health probe did not start")
+	}
+}
+
+func TestHealthConsecutiveFailureThreshold(t *testing.T) {
+	started := make(chan struct{}, 1)
+	statuses := make(chan int)
+	g := healthGateway(t, "http://example.invalid")
+	g.transport = healthRoundTripper(func(r *http.Request) (*http.Response, error) {
+		select {
+		case started <- struct{}{}:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		select {
+		case status := <-statuses:
+			return &http.Response{StatusCode: status, Body: http.NoBody}, nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+	// Keep response control deterministic; the next probe signals completion of the previous update.
+	g.routes[0].config.HealthCheck.Interval = "100ms"
+	stop := g.startHealthChecks(context.Background())
+	defer stop()
+	awaitProbe(t, started)
+	for i, status := range []int{500, 200, 500, 500} {
+		statuses <- status
+		awaitProbe(t, started)
+		eligible := g.routes[0].balancer.next() != nil
+		if want := i < 3; eligible != want {
+			t.Fatalf("after statuses through index %d: eligible=%v want=%v", i, eligible, want)
+		}
+	}
+}
+
+func TestHealthProbeDeadlineWithoutShutdown(t *testing.T) {
+	started := make(chan struct{}, 1)
+	expired := make(chan error, 1)
+	g := healthGateway(t, "http://example.invalid")
+	g.routes[0].timeout = 10 * time.Millisecond
+	g.routes[0].config.HealthCheck.Interval = "100ms"
+	g.routes[0].config.HealthCheck.UnhealthyThreshold = 1
+	g.transport = healthRoundTripper(func(r *http.Request) (*http.Response, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+		select {
+		case expired <- r.Context().Err():
+		default:
+		}
+		return nil, r.Context().Err()
+	})
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := g.startHealthChecks(parent)
+	defer stop()
+	awaitProbe(t, started)
+	select {
+	case err := <-expired:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("probe ended with %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe deadline did not fire")
+	}
+	waitHealth(t, g, false)
+	if parent.Err() != nil {
+		t.Fatal("parent cancelled before timeout assertion")
+	}
+}
