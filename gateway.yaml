@@ -1,0 +1,93 @@
+# Configuration supplied in the GatewayKit requirements.
+# Deferred features emit startup warnings; see README.md.
+gateway:
+  port: 8080
+  global_timeout: "30s"
+  global_rate_limit:
+    requests: 100
+    window: "60s"
+    strategy: "fixed_window"
+    per: "ip"
+routes:
+  - path: "/api/users"
+    methods: ["GET", "POST"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3001"
+    rate_limit:
+      requests: 30
+      window: "60s"
+      strategy: "sliding_window"
+      per: "ip"
+  - path: "/api/orders"
+    methods: ["GET", "POST", "PUT"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3002"
+      timeout: "5s"
+    retry:
+      attempts: 3
+      backoff: "exponential"
+      initial_delay: "1s"
+      on: [502, 503, 504]
+    rate_limit:
+      requests: 10
+      window: "10s"
+      strategy: "fixed_window"
+      per: "ip"
+  - path: "/api/products"
+    methods: ["GET"]
+    strip_prefix: true
+    upstream:
+      targets:
+        - url: "http://localhost:3003"
+          weight: 3
+        - url: "http://localhost:3004"
+          weight: 1
+      balance: "weighted_round_robin"
+      timeout: "10s"
+    health_check:
+      path: "/healthz"
+      interval: "30s"
+      unhealthy_threshold: 3
+  - path: "/api/legacy"
+    methods: ["GET", "POST"]
+    strip_prefix: true
+    upstream:
+      url: "http://localhost:3005"
+    request_transform:
+      headers:
+        add:
+          X-Gateway: "gatewaykit"
+          X-Request-Start: "$request_time"
+        remove: ["X-Debug", "X-Internal"]
+      body:
+        mapping:
+          user.id: "userId"
+          user.name: "userName"
+          meta.source: "$literal:gateway"
+          meta.timestamp: "$request_time"
+    response_transform:
+      headers:
+        add:
+          X-Served-By: "gatewaykit"
+        remove: ["Server", "X-Powered-By"]
+      body:
+        envelope:
+          data: "$body"
+          gateway_metadata:
+            served_at: "$response_time"
+            route: "$route_path"
+  - path: "/api/internal"
+    methods: ["GET", "POST"]
+    strip_prefix: false
+    upstream:
+      url: "http://localhost:3006"
+    auth:
+      type: "api_key"
+      header: "X-API-Key"
+      keys: ["sk_live_abc123", "sk_live_def456"] # Example values, not real credentials.
+    circuit_breaker:
+      threshold: 5
+      window: "60s"
+      cooldown: "30s"

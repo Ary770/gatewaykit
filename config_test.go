@@ -93,3 +93,19 @@ func TestTargetValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestProvidedConfiguration(t *testing.T) {
+	c, warnings, err := loadConfig("gateway.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Routes) != 5 || len(warnings) != 5 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
+		t.Fatalf("provided config not represented correctly: routes=%d warnings=%v", len(c.Routes), warnings)
+	}
+	if _, warnings, err := loadConfig("examples/demo.yaml"); err != nil || len(warnings) != 0 {
+		t.Fatalf("demo config: %v %v", warnings, err)
+	}
+	if _, _, err := loadConfig("does-not-exist.yaml"); err == nil {
+		t.Fatal("missing file accepted")
+	}
+}
