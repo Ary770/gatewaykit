@@ -12,7 +12,7 @@ From the repository root:
 ./scripts/demo.sh
 ```
 
-This starts the real binaries, checks every expected status, checks weighted distribution, and stops its own processes. Run this once before the interview to catch port conflicts. It requires ports 8081 and 3001–3006 to be free.
+This starts the real binaries, checks every expected status, checks weighted distribution, and stops its own processes. Run this once before the interview to catch port conflicts. It requires ports 8080 and 3001–3006 to be free.
 
 ## Run the demo one step at a time
 
@@ -33,7 +33,7 @@ Terminal 3 runs the requests below. Start a fresh gateway before the rate-limit 
 ### 1. Health
 
 ```sh
-curl -i http://localhost:8081/health
+curl -i http://localhost:8080/health
 ```
 
 Expected: 200, `status: healthy`, and uptime in whole seconds. This tells us the gateway is running, even if a backend is down.
@@ -41,7 +41,7 @@ Expected: 200, `status: healthy`, and uptime in whole seconds. This tells us the
 ### 2. Forwarding, prefix stripping, and body preservation
 
 ```sh
-curl -i 'http://localhost:8081/echo/hello?name=Ada' \
+curl -i 'http://localhost:8080/echo/hello?name=Ada' \
   -H 'Content-Type: application/json' \
   -d '{"message":"hello"}'
 ```
@@ -51,8 +51,8 @@ Expected: 200. The backend reports `/hello`, query `name=Ada`, method POST, and 
 ### 3. Routing errors
 
 ```sh
-curl -i http://localhost:8081/missing
-curl -i -X POST http://localhost:8081/products
+curl -i http://localhost:8080/missing
+curl -i -X POST http://localhost:8080/products
 ```
 
 Expected: 404, then 405 with `Allow: GET`. A path match and a method match are separate decisions.
@@ -60,8 +60,8 @@ Expected: 404, then 405 with `Allow: GET`. A path match and a method match are s
 ### 4. Authentication
 
 ```sh
-curl -i http://localhost:8081/private
-curl -i http://localhost:8081/private -H 'X-API-Key: demo-key'
+curl -i http://localhost:8080/private
+curl -i http://localhost:8080/private -H 'X-API-Key: demo-key'
 ```
 
 Expected: 401, then 200 from backend 3002. Authentication happens before rate limiting and forwarding.
@@ -70,9 +70,9 @@ Expected: 401, then 200 from backend 3002. Authentication happens before rate li
 
 ```sh
 for i in 1 2 3 4; do
-  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8081/limited
+  curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/limited
 done
-curl -i http://localhost:8081/limited
+curl -i http://localhost:8080/limited
 ```
 
 Expected: 200, 200, 200, 429; the final response includes `Retry-After`. Wait ten seconds from the first accepted request and try again: it returns 200. The automated tests use a controlled clock, so their boundary assertions do not sleep.
@@ -81,7 +81,7 @@ Expected: 200, 200, 200, 429; the final response includes `Retry-After`. Wait te
 
 ```sh
 for i in 1 2 3 4 5 6 7 8; do
-  curl -s -D - -o /dev/null http://localhost:8081/products/123 | grep -i x-mock-upstream
+  curl -s -D - -o /dev/null http://localhost:8080/products/123 | grep -i x-mock-upstream
 done
 ```
 
@@ -90,8 +90,8 @@ Expected: six requests to 3003 and two to 3004. The algorithm spreads requests a
 ### 7. Timeout and upstream error handling
 
 ```sh
-curl -i 'http://localhost:8081/timeout/slow?delay=2s'
-curl -i 'http://localhost:8081/echo/error?status=503'
+curl -i 'http://localhost:8080/timeout/slow?delay=2s'
+curl -i 'http://localhost:8080/echo/error?status=503'
 ```
 
 Expected: a 504 after roughly 100 milliseconds, then an unchanged upstream 503. No application-level retry is attempted.

@@ -29,7 +29,7 @@ for attempt in $(seq 1 50); do
     cat "$work/mock.log" "$work/gateway.log"
     exit 1
   fi
-  if curl -fsS --max-time 1 http://127.0.0.1:3001/healthz >/dev/null 2>&1 && curl -fsS --max-time 1 http://127.0.0.1:8081/health >/dev/null 2>&1; then ready=1; break; fi
+  if curl -fsS --max-time 1 http://127.0.0.1:3001/healthz >/dev/null 2>&1 && curl -fsS --max-time 1 http://127.0.0.1:8080/health >/dev/null 2>&1; then ready=1; break; fi
   sleep 0.1
 done
 if [ "$ready" != 1 ]; then cat "$work/mock.log" "$work/gateway.log"; exit 1; fi
@@ -40,7 +40,7 @@ check() {
   path=$3
   shift 3
   printf '\n%s\n' "$label"
-  status=$(curl -sS --max-time 5 -D "$work/headers" -o "$work/response" -w '%{http_code}' "http://127.0.0.1:8081$path" "$@")
+  status=$(curl -sS --max-time 5 -D "$work/headers" -o "$work/response" -w '%{http_code}' "http://127.0.0.1:8080$path" "$@")
   printf 'HTTP %s\n' "$status"
   cat "$work/response"
   printf '\n'
@@ -61,7 +61,7 @@ printf '\n8. Weighted balancing: eight requests must produce a 6:2 distribution\
 a=0
 b=0
 for attempt in $(seq 1 8); do
-  status=$(curl -sS --max-time 5 -D "$work/headers" -o "$work/response" -w '%{http_code}' http://127.0.0.1:8081/products/123)
+  status=$(curl -sS --max-time 5 -D "$work/headers" -o "$work/response" -w '%{http_code}' http://127.0.0.1:8080/products/123)
   if [ "$status" != 200 ]; then cat "$work/response"; exit 1; fi
   if grep -q '127.0.0.1:3003' "$work/headers"; then a=$((a+1)); elif grep -q '127.0.0.1:3004' "$work/headers"; then b=$((b+1)); else cat "$work/headers"; exit 1; fi
 done

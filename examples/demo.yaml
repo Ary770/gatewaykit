@@ -1,5 +1,5 @@
 gateway:
-  port: 8081
+  port: 8080
   global_timeout: 2s
 routes:
   - path: /echo

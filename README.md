@@ -51,7 +51,7 @@ go vet ./...
 ./scripts/demo.sh
 ```
 
-This builds and starts the real application and mock upstreams, asserts response codes and weighted distribution, and cleans up its processes. Requires Bash, curl, and free local ports 8081 and 3001–3006. It uses `examples/demo.yaml`, which changes routes and values and contains only implemented features. See [WALKTHROUGH.md](WALKTHROUGH.md) for the live presentation and code explanation.
+This builds and starts the real application and mock upstreams, asserts response codes and weighted distribution, and cleans up its processes. Requires Bash, curl, and free local ports 8080 and 3001–3006. It uses `examples/demo.yaml`, which changes routes and values and contains only implemented features. See [WALKTHROUGH.md](WALKTHROUGH.md) for the live presentation and code explanation.
 
 ## Feature coverage
 
