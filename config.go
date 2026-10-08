@@ -33,13 +33,35 @@ type RouteConfig struct {
 	Retry             yaml.Node                `yaml:"retry"`
 	RequestTransform  *RequestTransformConfig  `yaml:"request_transform"`
 	ResponseTransform *ResponseTransformConfig `yaml:"response_transform"`
-	CircuitBreaker    yaml.Node                `yaml:"circuit_breaker"`
+	CircuitBreaker    *CircuitBreakerConfig    `yaml:"circuit_breaker"`
 }
 
 type HealthCheckConfig struct {
 	Path               string `yaml:"path"`
 	Interval           string `yaml:"interval"`
 	UnhealthyThreshold int    `yaml:"unhealthy_threshold"`
+}
+
+type CircuitBreakerConfig struct {
+	Threshold int    `yaml:"threshold"`
+	Window    string `yaml:"window"`
+	Cooldown  string `yaml:"cooldown"`
+}
+
+func validateCircuitBreaker(c *CircuitBreakerConfig) error {
+	if c == nil {
+		return nil
+	}
+	if c.Threshold < 1 || c.Threshold > 1000000 {
+		return fmt.Errorf("threshold must be between 1 and 1000000")
+	}
+	if _, err := duration(c.Window); err != nil {
+		return fmt.Errorf("window: %w", err)
+	}
+	if _, err := duration(c.Cooldown); err != nil {
+		return fmt.Errorf("cooldown: %w", err)
+	}
+	return nil
 }
 
 type UpstreamConfig struct {
@@ -183,11 +205,14 @@ func (c *Config) validate() ([]string, error) {
 		if err := validateTransforms(*r); err != nil {
 			return nil, fmt.Errorf("%s.transform: %w", label, err)
 		}
+		if err := validateCircuitBreaker(r.CircuitBreaker); err != nil {
+			return nil, fmt.Errorf("%s.circuit_breaker: %w", label, err)
+		}
 		for _, feature := range []struct {
 			name string
 			node yaml.Node
 		}{
-			{"retry", r.Retry}, {"circuit_breaker", r.CircuitBreaker},
+			{"retry", r.Retry},
 		} {
 			if feature.node.Kind != 0 {
 				warnings = append(warnings, fmt.Sprintf("%s: %s is configured but NOT IMPLEMENTED; this setting has no effect", r.Path, feature.name))

@@ -64,13 +64,13 @@ func TestConfigDeferredFeaturesWarn(t *testing.T) {
     retry: {attempts: 3}
     request_transform: {headers: {add: {X-Test: yes}}}
     response_transform: {body: {envelope: {data: $body}}}
-    circuit_breaker: {threshold: 5}
+    circuit_breaker: {threshold: 5, window: "60s", cooldown: "30s"}
 `
 	_, warnings, err := decodeConfig(strings.NewReader(input))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(warnings) != 2 {
+	if len(warnings) != 1 {
 		t.Fatalf("warnings: %v", warnings)
 	}
 }
@@ -99,7 +99,7 @@ func TestProvidedConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Routes) != 5 || len(warnings) != 2 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
+	if len(c.Routes) != 5 || len(warnings) != 1 || c.Routes[1].Upstream.Timeout != "5s" || c.Routes[2].Upstream.Timeout != "10s" {
 		t.Fatalf("provided config not represented correctly: routes=%d warnings=%v", len(c.Routes), warnings)
 	}
 	if _, warnings, err := loadConfig("examples/demo.yaml"); err != nil || len(warnings) != 0 {

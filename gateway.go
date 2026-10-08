@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,7 @@ type route struct {
 	timeout  time.Duration
 	balancer *balancer
 	limiter  *rateLimiter
+	breaker  *circuitBreaker
 }
 
 type Gateway struct {
@@ -38,6 +40,10 @@ func newGateway(c Config, transport http.RoundTripper) *Gateway {
 		timeout, _ := duration(rc.Upstream.Timeout)
 		r := &route{config: rc, timeout: timeout}
 		r.balancer = newBalancer(rc.Upstream)
+		r.breaker = newCircuitBreaker(rc.CircuitBreaker)
+		if r.breaker != nil {
+			r.breaker.route = rc.Path
+		}
 		limit := rc.RateLimit
 		if limit == nil {
 			limit = c.Gateway.GlobalRateLimit
@@ -160,8 +166,28 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 		writeError(w, status, "request_transform_failed")
 		return
 	}
+	var upload *observedRequestBody
+	if out.Body != nil {
+		upload = &observedRequestBody{ReadCloser: out.Body}
+		out.Body = upload
+	}
+	permit, retryAfter := r.breaker.admit(g.now())
+	if permit == nil {
+		seconds := max(int64(1), int64((retryAfter-1)/time.Second)+1)
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "service_unavailable", "retry_after": seconds})
+		return
+	}
+	outcome := breakerNeutral
+	defer func() {
+		if req.Context().Err() != nil || upload != nil && upload.failed.Load() {
+			outcome = breakerNeutral
+		}
+		permit.finish(outcome, g.now())
+	}()
 	response, err := g.transport.RoundTrip(out)
 	if err != nil {
+		outcome = breakerFailure
 		status, message := http.StatusBadGateway, "bad_gateway"
 		var netErr net.Error
 		// A downstream read deadline can cancel the parent context before the
@@ -178,11 +204,17 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusSwitchingProtocols {
+		outcome = breakerFailure
 		writeError(w, http.StatusBadGateway, "unsupported_protocol_upgrade")
 		return
 	}
+	body := &observedUpstreamBody{ReadCloser: response.Body}
+	response.Body = body
 	removeHopHeaders(response.Header)
 	if err := g.transformResponse(response, req, r, values); err != nil {
+		if body.failed || response.StatusCode >= 500 {
+			outcome = breakerFailure
+		}
 		status := http.StatusBadGateway
 		if !time.Now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			status = http.StatusGatewayTimeout
@@ -197,10 +229,45 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, ta
 	}
 	w.WriteHeader(response.StatusCode)
 	if _, err := io.Copy(w, response.Body); err != nil {
+		if body.failed {
+			outcome = breakerFailure
+		}
 		// Headers may already be sent; abort instead of presenting a truncated body as complete.
 		slog.Warn("upstream response interrupted", "route", r.config.Path)
 		panic(http.ErrAbortHandler)
 	}
+	outcome = breakerSuccess
+	if response.StatusCode >= 500 {
+		outcome = breakerFailure
+	}
+}
+
+// Track upstream reads separately from downstream write errors.
+type observedUpstreamBody struct {
+	io.ReadCloser
+	failed bool
+}
+
+func (b *observedUpstreamBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		b.failed = true
+	}
+	return n, err
+}
+
+// net/http may read uploads on a transport goroutine.
+type observedRequestBody struct {
+	io.ReadCloser
+	failed atomic.Bool
+}
+
+func (b *observedRequestBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		b.failed.Store(true)
+	}
+	return n, err
 }
 
 func upstreamURL(in, target *url.URL, r *route) *url.URL {

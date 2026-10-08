@@ -2,7 +2,7 @@
 
 ## Scope and priorities
 
-This is a two-hour, AI-assisted take-home project. The first priority is a real, tested HTTP proxy that works with alternate configurations. Next are timeouts, API-key authentication, rate limiting, and backend selection. Retries, transformations, and circuit breakers are deliberately deferred. Active upstream health checks were added in the follow-up. Those configured features will produce startup warnings instead of preventing the provided example configuration from starting.
+The original two-hour submission is preserved at tag `core-submission-2026-10-08`. It prioritized real HTTP proxying, timeouts, authentication, rate limiting and balancing. Follow-up work has added transformations, active health checks and circuit breakers; retries are the remaining deferred feature.
 
 ## Implementation plan
 
@@ -68,3 +68,7 @@ output above that limit; all other forwarding remains streamed. Missing mapped
 fields become null, arrays are values rather than indexed paths, and conflicting
 destinations fail startup. Representation metadata is rebuilt after body changes.
 Retries, health checks and circuit breakers remain deferred at this stage.
+
+## Follow-up circuit breakers
+
+One route-owned breaker counts completed upstream failures in a rolling window. A single recovery probe and generation guards prevent concurrent or stale responses from resetting newer state. Local errors and client cancellation release probes neutrally.
