@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -181,5 +182,111 @@ func TestUpstreamRedirectReturnedWithoutFollowing(t *testing.T) {
 	g.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
 	if w.Code != 302 || w.Header().Get("Location") != "http://example.invalid/next" {
 		t.Fatalf("redirect: %+v", w)
+	}
+}
+
+func TestAuthenticationAndRateLimitPipeline(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(204) }))
+	defer upstream.Close()
+	g := testGateway(t, RouteConfig{Path: "/private", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}, Auth: &AuthConfig{Type: "api_key", Header: "X-Key", Keys: []string{"first", "second"}}, RateLimit: &RateLimitConfig{Requests: 1, Window: "10s", Strategy: "fixed_window", Per: "ip"}})
+	now := time.Unix(100, 0)
+	g.now = func() time.Time { return now }
+	for _, tc := range []struct {
+		key  string
+		code int
+	}{{"", 401}, {"wrong", 401}, {"second", 204}, {"first", 429}} {
+		req := httptest.NewRequest("GET", "/private", nil)
+		if tc.key != "" {
+			req.Header.Set("X-Key", tc.key)
+		}
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, req)
+		if w.Code != tc.code {
+			t.Fatalf("got %d want %d", w.Code, tc.code)
+		}
+		if tc.code == 429 && w.Header().Get("Retry-After") != "10" {
+			t.Fatalf("retry=%s", w.Header().Get("Retry-After"))
+		}
+		if tc.code == 401 && w.Header().Get("WWW-Authenticate") == "" {
+			t.Fatal("missing authentication challenge")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("unauthorized/limited request reached upstream; calls=%d", calls.Load())
+	}
+	now = now.Add(10 * time.Second)
+	req := httptest.NewRequest("GET", "/private", nil)
+	req.Header.Set("X-Key", "first")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req)
+	if w.Code != 204 || calls.Load() != 2 {
+		t.Fatalf("window did not reset: %d calls=%d", w.Code, calls.Load())
+	}
+}
+
+func TestDefaultRateLimitAndRouteOverride(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	defer upstream.Close()
+	c := Config{Gateway: GatewayConfig{GlobalRateLimit: &RateLimitConfig{Requests: 1, Window: "1m", Strategy: "fixed_window", Per: "global"}}, Routes: []RouteConfig{
+		{Path: "/one", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}},
+		{Path: "/two", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}},
+		{Path: "/override", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: upstream.URL}, RateLimit: &RateLimitConfig{Requests: 2, Window: "1m", Strategy: "sliding_window", Per: "global"}},
+	}}
+	if _, err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	t.Cleanup(transport.CloseIdleConnections)
+	g := newGateway(c, transport)
+	for _, tc := range []struct {
+		path string
+		code int
+	}{{"/one", 204}, {"/one", 429}, {"/two", 204}, {"/override", 204}, {"/override", 204}, {"/override", 429}, {"/health", 200}} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", tc.path, nil))
+		if w.Code != tc.code {
+			t.Fatalf("%s got %d want %d", tc.path, w.Code, tc.code)
+		}
+	}
+}
+
+func TestHeaderAuthenticationRejectsMultipleValues(t *testing.T) {
+	auth := &AuthConfig{Header: "X-Key", Keys: []string{"abc"}}
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Add("X-Key", "abc")
+	req.Header.Add("X-Key", "abc")
+	if authorized(req, auth) {
+		t.Fatal("ambiguous multiple key values accepted")
+	}
+}
+
+func TestWeightedBackendsEndToEnd(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "a:"+r.URL.Path) }))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "b:"+r.URL.Path) }))
+	defer b.Close()
+	g := testGateway(t, RouteConfig{Path: "/products", Methods: []string{"GET"}, StripPrefix: true, Upstream: UpstreamConfig{Balance: "weighted_round_robin", Targets: []TargetConfig{{URL: a.URL, Weight: 3}, {URL: b.URL, Weight: 1}}}})
+	counts := map[string]int{}
+	for i := 0; i < 8; i++ {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest("GET", "/products/123", nil))
+		if w.Code != 200 {
+			t.Fatalf("status=%d", w.Code)
+		}
+		counts[w.Body.String()]++
+	}
+	if counts["a:/123"] != 6 || counts["b:/123"] != 2 {
+		t.Fatalf("responses=%v", counts)
+	}
+}
+
+func TestRateLimitCapacityHTTPResponse(t *testing.T) {
+	g := testGateway(t, RouteConfig{Path: "/", Methods: []string{"GET"}, Upstream: UpstreamConfig{URL: "http://127.0.0.1:1"}, RateLimit: &RateLimitConfig{Requests: 10, Window: "1s", Strategy: "fixed_window", Per: "ip"}})
+	g.routes[0].limiter.capacity = 0
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != 503 || w.Header().Get("Retry-After") != "1" {
+		t.Fatalf("got %d headers=%v", w.Code, w.Header())
 	}
 }

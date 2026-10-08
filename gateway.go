@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,7 +21,8 @@ type route struct {
 	config      RouteConfig
 	escapedPath string
 	timeout     time.Duration
-	targets     []*url.URL
+	balancer    *balancer
+	limiter     *rateLimiter
 }
 
 type Gateway struct {
@@ -34,14 +37,12 @@ func newGateway(c Config, transport http.RoundTripper) *Gateway {
 	for _, rc := range c.Routes {
 		timeout, _ := duration(rc.Upstream.Timeout)
 		r := &route{config: rc, escapedPath: (&url.URL{Path: rc.Path}).EscapedPath(), timeout: timeout}
-		if rc.Upstream.URL != "" {
-			u, _ := url.Parse(rc.Upstream.URL)
-			r.targets = append(r.targets, u)
+		r.balancer = newBalancer(rc.Upstream)
+		limit := rc.RateLimit
+		if limit == nil {
+			limit = c.Gateway.GlobalRateLimit
 		}
-		for _, t := range rc.Upstream.Targets {
-			u, _ := url.Parse(t.URL)
-			r.targets = append(r.targets, u)
-		}
+		r.limiter = newRateLimiter(limit)
 		g.routes = append(g.routes, r)
 	}
 	sort.SliceStable(g.routes, func(i, j int) bool { return len(g.routes[i].escapedPath) > len(g.routes[j].escapedPath) })
@@ -63,7 +64,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
-	g.forward(w, req, r, r.targets[0])
+	if !authorized(req, r.config.Auth) {
+		w.Header().Set("WWW-Authenticate", `ApiKey realm="gatewaykit"`)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.limiter != nil {
+		allowed, retry, capacity := r.limiter.allow(clientIP(req), g.now())
+		if !allowed {
+			seconds := max(int64(1), int64((retry-1)/time.Second)+1)
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+			if !capacity {
+				writeError(w, http.StatusServiceUnavailable, "rate_limit_capacity_exceeded")
+			} else {
+				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded")
+			}
+			return
+		}
+	}
+	g.forward(w, req, r, r.balancer.next())
 }
 
 func (g *Gateway) match(path, method string) (*route, []string) {
@@ -194,4 +213,19 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		slog.Debug("response write failed", "status", fmt.Sprint(status))
 	}
+}
+
+func authorized(req *http.Request, auth *AuthConfig) bool {
+	if auth == nil {
+		return true
+	}
+	values := req.Header.Values(auth.Header)
+	if len(values) != 1 {
+		return false
+	}
+	matched := 0
+	for _, key := range auth.Keys {
+		matched |= subtle.ConstantTimeCompare([]byte(values[0]), []byte(key))
+	}
+	return matched == 1
 }
