@@ -154,3 +154,12 @@ python3 demo/run.py --check
 ```
 
 `demo/web/index.html` contains the browser controls; `demo/gateway.yaml` defines their routes. The page itself is served through GatewayKit: `/demo` forwards to the static server on 3099. Button clicks call the gateway on 8080, which forwards API requests to the mock backends. The Python launcher and test client are development tools, not gateway runtime dependencies.
+
+The browser page also includes four additional-feature controls:
+
+- Transform request and response: shows the original JSON, the mapped JSON received by the backend, header changes, and the response envelope.
+- Retry recovery: compares a 503 from backend 3005 with a successful request retried on backend 3006 after 100ms.
+- Active health checks: the route includes a permanently offline backend and a healthy backend; eight requests all reach the healthy one after probes exclude the offline target.
+- Circuit breaker cycle: two failures open the circuit, a request is rejected without an upstream response, and a successful probe restores traffic after the three-second cooldown. The button takes about seven seconds so repeated demonstrations can start from a recovered circuit.
+
+The automated browser-demo check now covers all 24 core and feature scenarios. Backend shutdown/recovery is additionally covered by the Go health-check tests; the browser health scenario demonstrates exclusion of an already-offline backend.

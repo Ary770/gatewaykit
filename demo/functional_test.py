@@ -82,4 +82,41 @@ check('Health remains available after failures',lambda:status('/health',200))
 print('Waiting for the real 10-second rate-limit window to expire…',flush=True)
 time.sleep(10.1)
 check('Rate limit recovers after window',lambda:status('/limited',200))
-print(f'All {len(results)} live functional checks passed.',flush=True)
+
+def transformations():
+    response = req('/transform/echo', 'POST', json.dumps({'userId': 7, 'userName': 'Ary'}),
+                   {'Content-Type': 'application/json', 'X-Debug': 'remove-me'})
+    assert response['status'] == 200, response
+    received = response['body']['data']
+    assert json.loads(received['body']) == {'user': {'id': 7, 'name': 'Ary'}}
+    assert 'X-Debug' not in received['headers']
+    assert received['headers']['X-Gateway'] == ['gatewaykit']
+    assert response['headers']['x-served-by'] == 'gatewaykit'
+    assert response['body']['route'] == '/transform'
+    return 'Body mapping, header removal/addition, and response envelope verified'
+check('Request and response transformations', transformations)
+
+def retry_recovery():
+    assert req('/retry-baseline/echo')['status'] == 503
+    response = req('/retry/echo')
+    assert response['status'] == 200 and response['body']['upstream'] == '127.0.0.1:3006', response
+    return '503 baseline; retry succeeds on backend 3006'
+check('Retry recovery', retry_recovery)
+
+def health_exclusion():
+    responses = [req('/healthy/echo') for _ in range(8)]
+    assert all(r['status'] == 200 and r['body']['upstream'] == '127.0.0.1:3006' for r in responses), responses
+    return 'All 8 requests avoid the unavailable backend'
+check('Active health exclusion', health_exclusion)
+
+def circuit_recovery():
+    assert req('/breaker/echo?status=503')['status'] == 503
+    assert req('/breaker/echo?status=503')['status'] == 503
+    blocked = req('/breaker/echo')
+    assert blocked['status'] == 503 and blocked['body']['error'] == 'service_unavailable', blocked
+    assert 'x-mock-upstream' not in blocked['headers']
+    time.sleep(3.2)
+    assert req('/breaker/echo')['status'] == 200
+    return 'Two failures open circuit; local rejection; successful recovery after cooldown'
+check('Circuit breaker recovery', circuit_recovery)
+print(f'All {len(results)} live functional checks passed.', flush=True)

@@ -50,3 +50,62 @@ routes:
     upstream:
       url: http://127.0.0.1:39991
       timeout: 300ms
+  - path: /transform
+    methods: [POST]
+    strip_prefix: true
+    upstream:
+      url: http://127.0.0.1:3001
+    request_transform:
+      headers:
+        add: {X-Gateway: gatewaykit}
+        remove: [X-Debug]
+      body:
+        mapping:
+          user.id: userId
+          user.name: userName
+    response_transform:
+      headers:
+        add: {X-Served-By: gatewaykit}
+      body:
+        envelope:
+          data: "$body"
+          route: "$route_path"
+  - path: /retry-baseline
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      url: "http://127.0.0.1:3005?status=503"
+  - path: /retry
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      targets:
+        - url: "http://127.0.0.1:3005?status=503"
+        - url: http://127.0.0.1:3006
+      balance: round_robin
+    retry:
+      attempts: 2
+      backoff: fixed
+      initial_delay: 100ms
+      on: [503]
+  - path: /healthy
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      targets:
+        - url: http://127.0.0.1:39991
+        - url: http://127.0.0.1:3006
+      balance: round_robin
+    health_check:
+      path: /healthz
+      interval: 100ms
+      unhealthy_threshold: 1
+  - path: /breaker
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      url: http://127.0.0.1:3005
+    circuit_breaker:
+      threshold: 2
+      window: 10s
+      cooldown: 3s
