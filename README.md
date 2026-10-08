@@ -135,3 +135,7 @@ replay function to the transport for unsafe methods.
 
 Run `./scripts/demo-features.sh` to exercise all four follow-up features on
 ports 18080, 13001 and 13002 without disturbing the core demo on port 8080.
+
+## Browser demo
+
+Run `python3 demo/run.py`, then open http://127.0.0.1:8080/demo/index.html. This builds the current application and starts all local demo services. Python 3 is needed only for demo tooling. Press Ctrl+C to stop. See [DEMO.md](DEMO.md) for details and automated functional checks.

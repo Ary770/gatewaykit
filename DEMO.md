@@ -136,3 +136,21 @@ The assertions show:
 
 Each feature has its own route so the demonstrated cause and effect is clear.
 This is a live smoke demo; unit and integration tests cover additional boundaries.
+
+## Interactive browser demo
+
+Requires Go and Python 3 (standard library only). From the repository root:
+
+```sh
+python3 demo/run.py
+```
+
+Open http://127.0.0.1:8080/demo/index.html. The launcher builds the current code, starts the gateway, mock backends, and static page server, and stops them when you press Ctrl+C. Ports 8080, 3099, and 3001–3006 must be free. Stop any other demo before starting this one.
+
+For a repeatable functional check that starts and stops its own services:
+
+```sh
+python3 demo/run.py --check
+```
+
+`demo/web/index.html` contains the browser controls; `demo/gateway.yaml` defines their routes. The page itself is served through GatewayKit: `/demo` forwards to the static server on 3099. Button clicks call the gateway on 8080, which forwards API requests to the mock backends. The Python launcher and test client are development tools, not gateway runtime dependencies.

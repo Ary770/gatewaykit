@@ -1,0 +1,52 @@
+gateway:
+  port: 8080
+  global_timeout: 2s
+routes:
+  - path: /echo
+    methods: [GET, POST]
+    strip_prefix: true
+    upstream:
+      url: http://127.0.0.1:3001
+  - path: /limited
+    methods: [GET]
+    upstream:
+      url: http://127.0.0.1:3001
+    rate_limit:
+      requests: 3
+      window: 10s
+      strategy: fixed_window
+      per: global
+  - path: /private
+    methods: [GET]
+    upstream:
+      url: http://127.0.0.1:3002
+    auth:
+      type: api_key
+      header: X-API-Key
+      keys: [demo-key]
+  - path: /products
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      targets:
+        - url: http://127.0.0.1:3003
+          weight: 3
+        - url: http://127.0.0.1:3004
+          weight: 1
+      balance: weighted_round_robin
+  - path: /timeout
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      url: http://127.0.0.1:3001
+      timeout: 100ms
+  - path: /demo
+    methods: [GET]
+    strip_prefix: true
+    upstream:
+      url: http://127.0.0.1:3099
+  - path: /offline
+    methods: [GET]
+    upstream:
+      url: http://127.0.0.1:39991
+      timeout: 300ms
