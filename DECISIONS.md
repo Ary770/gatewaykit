@@ -2,7 +2,7 @@
 
 ## Scope and priorities
 
-This is a two-hour, AI-assisted take-home project. The first priority is a real, tested HTTP proxy that works with alternate configurations. Next are timeouts, API-key authentication, rate limiting, and backend selection. Retries, transformations, active upstream health checking, and circuit breakers are deliberately deferred. Those configured features will produce startup warnings instead of preventing the provided example configuration from starting.
+This is a two-hour, AI-assisted take-home project. The first priority is a real, tested HTTP proxy that works with alternate configurations. Next are timeouts, API-key authentication, rate limiting, and backend selection. Retries, transformations, and circuit breakers are deliberately deferred. Active upstream health checks were added in the follow-up. Those configured features will produce startup warnings instead of preventing the provided example configuration from starting.
 
 ## Implementation plan
 
@@ -40,13 +40,13 @@ Bodies are streamed to avoid a memory cost proportional to payload size. A timeo
 
 The baseline proxy, error behavior, and configurable routes establish one end-to-end slice. Authentication and rate limiting exercise security boundaries and concurrent state. Weighted balancing completes the supplied multi-target route without introducing retry safety issues. Both limiter algorithms fit within the implementation budget and have deterministic boundary tests.
 
-Retries were deferred because retrying POST/PUT requests can duplicate side effects and requires deliberate replay/idempotency semantics. Transformations need explicit behavior for invalid JSON, missing paths, non-JSON responses, and body-size limits. Active health checking adds background lifecycle and recovery policy. Circuit breakers require a defined failure classification and synchronized half-open probes. These should each be implemented and tested completely rather than partially advertised.
+Retries were deferred because retrying POST/PUT requests can duplicate side effects and requires deliberate replay/idempotency semantics. Transformations need explicit behavior for invalid JSON, missing paths, non-JSON responses, and body-size limits. Active health checking now has an explicit lifecycle: run starts probes after binding and joins them on every exit. Each route target tracks health independently; network I/O happens outside balancing locks, and state transitions reset scheduling credit. Circuit breakers require a defined failure classification and synchronized half-open probes. These should each be implemented and tested completely rather than partially advertised.
 
 ## Trade-offs and next steps
 
 The route scan is linear, appropriate for a small static route list. A mutex serializes each route's limiter bookkeeping and backend selection; it never serializes proxy I/O. Exact sliding windows use memory proportional to accepted requests retained in the active window. Identity tables have a 10,000-entry cap per route and lazy expiration; limits are not durable or shared across replicas.
 
-Next, I would implement transformations with bounded buffering and explicit JSON failure contracts, then retry behavior restricted by idempotency policy. Circuit breakers and health checks would follow with controllable clocks and recovery tests. Before production use, I would add traffic metrics, structured failure categorization, trusted-proxy configuration, end-to-end resource limits, and load tests. More features are less valuable than proving the deployed operating limits.
+Next, I would implement transformations with bounded buffering and explicit JSON failure contracts, then retry behavior restricted by idempotency policy. Circuit breakers would follow with controllable clocks and recovery tests. Before production use, I would add traffic metrics, structured failure categorization, trusted-proxy configuration, end-to-end resource limits, and load tests. More features are less valuable than proving the deployed operating limits.
 
 ## AI use and verification
 

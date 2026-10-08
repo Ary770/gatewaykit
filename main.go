@@ -65,6 +65,8 @@ func run(ctx context.Context, args []string, configEnv string) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
+	stopHealth := gateway.startHealthChecks(ctx)
+	defer stopHealth()
 	slog.Info("gateway listening", "address", listener.Addr().String(), "routes", len(config.Routes))
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()

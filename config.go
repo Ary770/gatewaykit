@@ -23,7 +23,7 @@ type GatewayConfig struct {
 }
 
 type RouteConfig struct {
-	HealthCheck       yaml.Node                `yaml:"health_check"`
+	HealthCheck       *HealthCheckConfig       `yaml:"health_check"`
 	Path              string                   `yaml:"path"`
 	Methods           []string                 `yaml:"methods"`
 	StripPrefix       bool                     `yaml:"strip_prefix"`
@@ -34,6 +34,12 @@ type RouteConfig struct {
 	RequestTransform  *RequestTransformConfig  `yaml:"request_transform"`
 	ResponseTransform *ResponseTransformConfig `yaml:"response_transform"`
 	CircuitBreaker    yaml.Node                `yaml:"circuit_breaker"`
+}
+
+type HealthCheckConfig struct {
+	Path               string `yaml:"path"`
+	Interval           string `yaml:"interval"`
+	UnhealthyThreshold int    `yaml:"unhealthy_threshold"`
 }
 
 type UpstreamConfig struct {
@@ -161,6 +167,9 @@ func (c *Config) validate() ([]string, error) {
 				return nil, fmt.Errorf("%s.upstream.targets[%d].weight must be between 1 and 1000000", label, j)
 			}
 		}
+		if err := validateHealthCheck(r.HealthCheck); err != nil {
+			return nil, fmt.Errorf("%s.health_check: %w", label, err)
+		}
 		if r.Auth != nil {
 			if r.Auth.Type != "api_key" || !validToken(r.Auth.Header) || len(r.Auth.Keys) == 0 {
 				return nil, fmt.Errorf("%s.auth requires type api_key, a valid header, and nonempty keys", label)
@@ -179,7 +188,6 @@ func (c *Config) validate() ([]string, error) {
 			node yaml.Node
 		}{
 			{"retry", r.Retry}, {"circuit_breaker", r.CircuitBreaker},
-			{"health_check", r.HealthCheck},
 		} {
 			if feature.node.Kind != 0 {
 				warnings = append(warnings, fmt.Sprintf("%s: %s is configured but NOT IMPLEMENTED; this setting has no effect", r.Path, feature.name))

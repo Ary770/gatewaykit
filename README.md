@@ -70,10 +70,10 @@ This builds and starts the real application and mock upstreams, asserts response
 | Round robin and smooth weighted round robin | Implemented |
 | Retry and backoff | Deferred; warned and ignored |
 | Request/response header and body transformations | Implemented (follow-up) |
-| Active upstream health checks | Deferred; warned and ignored |
+| Active upstream health checks | Implemented (follow-up) |
 | Circuit breaker | Deferred; warned and ignored |
 
-Deferred settings are accepted so the provided configuration can start, but they do **not** affect requests. Failed backends still remain eligible for balancing. These are explicit omissions, not partial implementations.
+Deferred settings are accepted so the provided configuration can start, but they do **not** affect requests. These are explicit omissions, not partial implementations.
 
 ## Defined behavior
 
@@ -110,3 +110,5 @@ upstream bodies return 502; deadline expiry returns 504 before response headers.
 Empty requests remain empty; HEAD, 204 and 304 responses retain bodyless semantics.
 Rewritten bodies receive JSON content type and discard stale representation metadata,
 even when header rules specify those metadata fields.
+
+Active health checks use GET at the target origin plus the configured path, without following redirects. HTTP 2xx/3xx is healthy. Targets start eligible; `unhealthy_threshold` consecutive failures exclude them (default 1), and one successful check restores them. When all targets are excluded the route returns 503. Checks run immediately, then wait the configured interval after each result; timeout is the smallest of the route timeout, interval, and five seconds. Shutdown cancels and joins probes. `/health` remains gateway liveness only.

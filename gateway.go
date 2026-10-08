@@ -78,7 +78,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !g.allowRateLimitedRequest(w, req, r.limiter) {
 		return
 	}
-	g.forward(w, req, r, r.balancer.next(), deadline)
+	target := r.balancer.next()
+	if target == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
+		return
+	}
+	g.forward(w, req, r, target, deadline)
 }
 
 func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Request, limiter *rateLimiter) bool {
