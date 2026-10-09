@@ -137,9 +137,8 @@ func waitBackoff(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// roundTripAttempts sends requests until one succeeds, cannot be retried, or uses the last attempt.
-// It closes unused responses before waiting. Only the final response is returned,
-// and all attempts must finish within the original time limit.
+// roundTripAttempts sends the request and retries failures allowed by the settings.
+// Return only the final response. Every attempt uses the same time limit.
 func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.URL, target *url.URL, attempts int, c *RetryConfig) (*http.Response, error) {
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := out.Context().Err(); err != nil {
@@ -155,12 +154,12 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 		if target == nil {
 			return nil, errNoHealthyBackends
 		}
-		// Build the backend URL, keeping the query and applying prefix removal if enabled.
+		// Set the backend address and remove the route prefix if configured.
 		request := out.Clone(out.Context())
 		request.URL = upstreamURL(incoming, target, r)
 		request.Host = target.Host
 		if attempt > 0 && out.GetBody != nil {
-			// Give this retry a fresh reader for the same saved request body.
+			// Send the same saved body again for this retry.
 			var err error
 			request.Body, err = out.GetBody()
 			if err != nil {
@@ -179,12 +178,12 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 		} else {
 			status = response.StatusCode
 		}
-		// Return to gateway.go when no more attempts are allowed or needed.
+		// Return the response or error when we should stop retrying.
 		if attempt+1 == attempts || out.Context().Err() != nil || !c.includes(status) {
 			return response, err
 		}
 		if response != nil {
-			// Close the discarded response before making another attempt.
+			// Close this response because we are going to try again.
 			response.Body.Close()
 		}
 	}

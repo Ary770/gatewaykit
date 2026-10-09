@@ -50,7 +50,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		writeError(w, http.StatusBadRequest, "ambiguous_path")
 		return
 	}
-	// Find the most specific route that accepts this path and HTTP method.
+	// Check the longest matching route for this path and HTTP method.
 	r, allowed := g.match(req.URL.Path, req.Method)
 	if r == nil {
 		writeRouteRejection(w, allowed)
@@ -72,8 +72,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	g.forward(w, req, r, deadline)
 }
 
-// newGateway prepares shared route state once and sorts routes by specificity.
-// It creates policy objects but starts no background workers or network requests.
+// newGateway prepares each route's backend selector, request counter, and circuit breaker.
+// Check longer route paths first. No requests or background tasks start here.
 func newGateway(c Config, transport http.RoundTripper) *Gateway {
 	defaultTimeout, _ := duration(c.Gateway.GlobalTimeout)
 	g := &Gateway{transport: transport, started: time.Now(), now: time.Now, defaultTimeout: defaultTimeout}
@@ -126,8 +126,9 @@ func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Reque
 	return false
 }
 
-// match selects the longest matching path at a segment boundary. A method rejection
-// on that path cannot fall through to a broader route with weaker policies.
+// match checks the longest route path that matches the request.
+// Match /api/users and its children, but not /api/users-extra.
+// If the method is rejected, do not try a shorter route to bypass its rules.
 func (g *Gateway) match(path, method string) (*route, []string) {
 	var allowed []string
 	matchedLength := -1
@@ -151,13 +152,13 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 	return nil, allowed
 }
 
-// forward gives preparation, attempts, and response handling one shared deadline.
-// The outgoing request is cloned so forwarding changes do not mutate the client request.
+// forward prepares the backend request and passes it to forwardPreparedRequest.
+// Preparing, sending, and returning the response all use the same time limit.
 func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, deadline time.Time) {
 	// Stop backend work when the time limit expires or the client disconnects.
 	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	defer cancel()
-	// Copy the request so backend-specific changes leave the original unchanged.
+	// Make a separate backend request so the original request stays unchanged.
 	out := cloneUpstreamRequest(req, ctx)
 	values := transformValues{requestTime: g.now().UTC().Format(time.RFC3339Nano), route: r.config.Path}
 	// Apply request changes once and save the body if it needs to be sent again.
@@ -169,8 +170,8 @@ func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, de
 	g.forwardPreparedRequest(w, req, out, r, values, attempts, deadline)
 }
 
-// cloneUpstreamRequest creates the backend request, removes connection-specific
-// metadata, and derives forwarding identity from the client socket rather than headers.
+// cloneUpstreamRequest copies the client request and removes headers that cannot be forwarded.
+// Use the client's actual connection to identify it, rather than trusting its headers.
 func cloneUpstreamRequest(req *http.Request, ctx context.Context) *http.Request {
 	out := req.Clone(ctx)
 	out.RequestURI = ""
@@ -179,7 +180,7 @@ func cloneUpstreamRequest(req *http.Request, ctx context.Context) *http.Request 
 	out.TransferEncoding = nil
 	out.Header = req.Header.Clone()
 	removeHopHeaders(out.Header)
-	// Forwarded identity is derived from the socket, never from client-supplied headers.
+	// Replace client-supplied forwarding headers with values from the actual connection.
 	out.Header.Del("Forwarded")
 	out.Header.Del("X-Forwarded-For")
 	out.Header.Del("X-Forwarded-Host")
@@ -194,8 +195,8 @@ func cloneUpstreamRequest(req *http.Request, ctx context.Context) *http.Request 
 	return out
 }
 
-// prepareUpstreamRequest applies the request transformation once, then prepares
-// identical replay bytes when retries are allowed. Preparation errors stop before sending.
+// prepareUpstreamRequest applies configured request changes once.
+// Save the body if retries need it. Stop here if preparation fails.
 func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Request, r *route, values transformValues, deadline time.Time) (int, bool) {
 	if status, err := g.transformRequest(out, r, values); err != nil {
 		if !time.Now().Before(deadline) || errors.Is(out.Context().Err(), context.DeadlineExceeded) {
@@ -221,10 +222,10 @@ func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Reques
 	return attempts, true
 }
 
-// forwardPreparedRequest selects a backend, checks circuit admission, and returns
-// the final attempted response after transformation. This is the network exchange.
-// Keep breaker accounting around the complete exchange, including streaming.
-// Client upload failures and canceled requests must not count as backend failures.
+// forwardPreparedRequest chooses a backend and checks the circuit breaker.
+// It sends the request, applies response changes, and sends the response to the client.
+// The circuit breaker records one result after response handling finishes.
+// Client upload errors and canceled requests do not count as backend failures.
 func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.Request, r *route, values transformValues, attempts int, deadline time.Time) {
 	// Choose a backend that is currently marked healthy.
 	target := r.balancer.next()
@@ -262,12 +263,10 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		}
 		outcome = breakerFailure
 		status, message := http.StatusBadGateway, "bad_gateway"
-		// A downstream read deadline can cancel the parent context before the
-		// context timer reports DeadlineExceeded. The shared deadline is authoritative.
+		// Check the clock too; a client read timeout can cancel the request first.
 		if upstreamErrorStatus(err, out.Context()) == http.StatusGatewayTimeout {
 			status, message = http.StatusGatewayTimeout, "gateway_timeout"
-			// A read timeout cancels net/http's connection context permanently.
-			// Close it so the next request starts on a healthy connection.
+			// Close this client connection; it cannot be reused after a read timeout.
 			w.Header().Set("Connection", "close")
 		}
 		slog.Warn("upstream request failed", "route", r.config.Path, "category", message)
@@ -306,7 +305,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		if body.failed {
 			outcome = breakerFailure
 		}
-		// Headers may already be sent; abort instead of presenting a truncated body as complete.
+		// The response has started; close the connection to show that the body is incomplete.
 		slog.Warn("upstream response interrupted", "route", r.config.Path)
 		panic(http.ErrAbortHandler)
 	}
@@ -344,8 +343,8 @@ func (b *observedRequestBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// upstreamURL combines the selected backend base path, optional prefix stripping,
-// and original query while preserving the unambiguous escaping of the client suffix.
+// upstreamURL builds the backend URL, removes the route prefix if configured,
+// and keeps the query string and path encoding.
 func upstreamURL(in, target *url.URL, r *route) *url.URL {
 	result := *target
 	path := in.EscapedPath()
@@ -375,8 +374,8 @@ func upstreamURL(in, target *url.URL, r *route) *url.URL {
 	return &result
 }
 
-// removeHopHeaders removes headers belonging to one network connection, including
-// additional names listed by Connection, before copying headers across the gateway.
+// removeHopHeaders removes headers that apply only to the original connection.
+// Also remove any headers named in the Connection header.
 func removeHopHeaders(h http.Header) {
 	for _, line := range h.Values("Connection") {
 		for _, key := range strings.Split(line, ",") {
@@ -388,7 +387,7 @@ func removeHopHeaders(h http.Header) {
 	}
 }
 
-// clientIP uses the TCP peer address for quota identity; client headers cannot choose it.
+// clientIP reads the client's IP address from its connection, not from its headers.
 func clientIP(req *http.Request) string {
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
@@ -408,8 +407,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	}
 }
 
-// authorized accepts exactly one configured API-key header value and compares it
-// against all allowed keys using constant-time comparison. No policy means access is allowed.
+// authorized checks that one API-key header contains an allowed key.
+// Without auth settings, allow the request. Compare every allowed key without stopping at a match.
 func authorized(req *http.Request, auth *AuthConfig) bool {
 	if auth == nil {
 		return true
@@ -454,13 +453,13 @@ func stripEscapedPrefix(raw, prefix string) string {
 	return raw[index:]
 }
 
-// setClientDeadlines bounds client uploads and response writes, which an outbound
-// request context alone cannot interrupt. The returned deadline also governs backend work.
+// setClientDeadlines limits how long client uploads and response writes can take.
+// Return the same deadline for the backend request.
 func setClientDeadlines(w http.ResponseWriter, timeout time.Duration) time.Time {
 	controller := http.NewResponseController(w)
 	deadline := time.Now().Add(timeout)
-	// Incoming request bodies and blocked downstream writes are independent of
-	// the outbound context. The write grace lets us send a 504 after a read timeout.
+	// Backend cancellation alone cannot stop client reads and writes.
+	// Allow one extra second to send a 504 response after a read timeout.
 	_ = controller.SetReadDeadline(deadline)
 	_ = controller.SetWriteDeadline(deadline.Add(time.Second))
 	return deadline

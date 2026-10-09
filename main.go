@@ -27,8 +27,7 @@ func main() {
 	}
 }
 
-// run starts the app and cleans up when it stops. One HTTP sender is reused
-// for backend requests. Incoming requests are handled by Gateway.ServeHTTP.
+// run reads the settings, prepares the gateway, and starts the server.
 func run(ctx context.Context, args []string, configEnv string) error {
 	path, err := resolveConfigPath(args, configEnv)
 	if err != nil {
@@ -48,7 +47,7 @@ func run(ctx context.Context, args []string, configEnv string) error {
 	transport := newUpstreamTransport()
 	defer transport.CloseIdleConnections()
 
-	// Create each route and its counters, then give the gateway to the HTTP server.
+	// Prepare the routes, then start accepting requests.
 	gateway := newGateway(config, transport)
 	return serveGateway(ctx, gateway, config.Gateway.Port)
 }
@@ -76,7 +75,7 @@ func resolveConfigPath(args []string, configEnv string) (string, error) {
 	return *path, nil
 }
 
-// newUpstreamTransport creates the HTTP sender and enables reuse of backend connections.
+// newUpstreamTransport creates one HTTP sender that reuses backend connections.
 // It sends directly to backends and leaves compressed responses unchanged.
 func newUpstreamTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -98,18 +97,18 @@ func serveGateway(ctx context.Context, gateway *Gateway, port int) error {
 		MaxHeaderBytes: 1 << 20,
 	}
 
-	// Open the server port before health checks, so a busy port fails early.
-	// When serveGateway returns, stop the checks and wait for them to finish.
+	// Open the port first; stop here if another app is using it.
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
+	// Start backend health checks and stop them when this function finishes.
 	stopHealth := gateway.startHealthChecks(ctx)
 	defer stopHealth()
 	slog.Info("gateway listening", "address", listener.Addr().String(), "routes", len(gateway.routes))
 
-	// Run the server in the background while waiting for an error or a stop signal.
-	// The channel holds one result so the server can report an error while shutdown waits.
+	// Run the server while this function waits for an error or a stop signal.
+	// Leave room for one result so the server can report it without waiting.
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()
 	select {
@@ -120,7 +119,7 @@ func serveGateway(ctx context.Context, gateway *Gateway, port int) error {
 		return err
 	case <-ctx.Done():
 		// Stop accepting requests and give active requests up to five seconds to finish.
-		// Use a new shutdown timer because the app's stop signal has already fired.
+		// Give shutdown its own timer because the app's stop signal has already fired.
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {

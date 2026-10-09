@@ -103,7 +103,8 @@ func loadConfig(path string) (Config, []string, error) {
 	return decodeConfig(f)
 }
 
-// decodeConfig reads one YAML document, rejects unknown fields, and checks the settings.
+// decodeConfig converts YAML into Go settings and checks them.
+// Reject unknown setting names and files containing more than one YAML document.
 func decodeConfig(r io.Reader) (Config, []string, error) {
 	var c Config
 	decoder := yaml.NewDecoder(r)
@@ -119,8 +120,8 @@ func decodeConfig(r io.Reader) (Config, []string, error) {
 	return c, warnings, err
 }
 
-// validate coordinates startup checks. The shared registry detects path/method
-// conflicts across routes after their paths have been normalized.
+// validate checks the gateway settings, then each route.
+// Reject two routes that use the same path and HTTP method.
 func (c *Config) validate() ([]string, error) {
 	if err := c.Gateway.validate(); err != nil {
 		return nil, err
@@ -135,7 +136,7 @@ func (c *Config) validate() ([]string, error) {
 	return nil, nil
 }
 
-// validate resolves gateway-wide defaults and checks the default route policies.
+// validate fills in missing gateway defaults and checks their values.
 func (g *GatewayConfig) validate() error {
 	if g.Port == 0 {
 		g.Port = 8080
@@ -155,8 +156,8 @@ func (g *GatewayConfig) validate() error {
 	return nil
 }
 
-// validate checks one route in order, keeping field-specific checks in their helpers.
-// label identifies this route in startup errors; seen belongs to the whole configuration.
+// validate checks this route's path, methods, backend, and optional features.
+// Error messages name the route; seen tracks path/method pairs across all routes.
 func (r *RouteConfig) validate(label, defaultTimeout string, seen map[string]bool) error {
 	if err := r.validateMatch(label, seen); err != nil {
 		return err
@@ -188,8 +189,8 @@ func (r *RouteConfig) validate(label, defaultTimeout string, seen map[string]boo
 	return nil
 }
 
-// validateMatch normalizes the path and registers its allowed methods.
-// Routes may share a normalized path only when their methods do not overlap.
+// validateMatch checks the path and methods and removes trailing slashes.
+// Two routes can share a path if they accept different HTTP methods.
 func (r *RouteConfig) validateMatch(label string, seen map[string]bool) error {
 	if !strings.HasPrefix(r.Path, "/") || strings.ContainsAny(r.Path, "?#\r\n") {
 		return fmt.Errorf("%s.path must be an absolute URL path without query or fragment", label)
@@ -217,7 +218,7 @@ func (r *RouteConfig) validateMatch(label string, seen map[string]bool) error {
 	return nil
 }
 
-// validateTimeout inherits the gateway timeout when this upstream has no override.
+// validateTimeout uses the gateway's time limit when the route has none.
 func (u *UpstreamConfig) validateTimeout(label, defaultTimeout string) error {
 	if u.Timeout == "" {
 		u.Timeout = defaultTimeout
@@ -228,7 +229,7 @@ func (u *UpstreamConfig) validateTimeout(label, defaultTimeout string) error {
 	return nil
 }
 
-// validateDestinations checks backend URLs and resolves the balancing default.
+// validateDestinations checks backend addresses and how the gateway chooses between them.
 func (u *UpstreamConfig) validateDestinations(label string) error {
 	if (u.URL == "") == (len(u.Targets) == 0) {
 		return fmt.Errorf("%s.upstream requires exactly one of url or targets", label)
