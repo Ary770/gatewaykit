@@ -2,6 +2,8 @@
 
 Use these speaking notes to explain the Go app you submitted. Follow one request, `GET /api/users/123`, from its YAML settings to the backend and back. Show one function at a time and explain what it does, why it is here, and how it is tested.
 
+For shorter file-by-file speaking notes, use [PRESENTATION_NOTES.md](/Users/arybaldioceda/dev/gatewaykit/PRESENTATION_NOTES.md).
+
 Aim for about 20 minutes, leaving time for questions.
 
 **Presentation order:** settings → startup → request checks → backend request → response → additional features → tests → live examples.
