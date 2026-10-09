@@ -238,7 +238,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		upload = &observedRequestBody{ReadCloser: out.Body}
 		out.Body = upload
 	}
-	// FEATURE ADD-ON: Circuit breaker - check whether this route can send now.
+	// FEATURE ADD-ON: Circuit breaker - block requests after repeated backend failures.
 	permit, retryAfter := r.breaker.admit(g.now())
 	if permit == nil {
 		seconds := max(int64(1), int64((retryAfter-1)/time.Second)+1)
