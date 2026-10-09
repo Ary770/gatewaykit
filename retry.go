@@ -1,3 +1,7 @@
+// Safe request replay: prepare bytes once, retry selected failures with backoff
+// (a delay between attempts), and expose only the final response. All attempts
+// share one deadline, one quota charge, and one circuit-breaker outcome.
+
 package main
 
 import (
@@ -25,6 +29,7 @@ const maxReplayBodyBytes = 1 << 20
 var errReplayBodyTooLarge = errors.New("retry request body exceeds 1 MiB")
 var errNoHealthyBackends = errors.New("no healthy upstreams")
 
+// validateRetry bounds total attempts and validates the delay strategy and retryable statuses.
 func validateRetry(c *RetryConfig) error {
 	if c == nil {
 		return nil
@@ -51,6 +56,8 @@ func validateRetry(c *RetryConfig) error {
 	return nil
 }
 
+// retryableMethod permits methods whose HTTP semantics allow repetition without
+// additional intended effects. POST/PATCH remain single-attempt even with an idempotency key.
 func retryableMethod(method string) bool {
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
@@ -118,6 +125,7 @@ func (c *RetryConfig) delay(retryNumber int) time.Duration {
 	return delay
 }
 
+// waitBackoff delays the next attempt while allowing cancellation to stop the wait.
 func waitBackoff(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -176,6 +184,8 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 	panic("retry attempts must be positive")
 }
 
+// upstreamErrorStatus distinguishes deadline/timeout failures (504) from other
+// transport failures (502), consulting the shared deadline when cancellation signals race.
 func upstreamErrorStatus(err error, ctx context.Context) int {
 	var netErr net.Error
 	deadline, hasDeadline := ctx.Deadline()

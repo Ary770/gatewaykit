@@ -1,3 +1,7 @@
+// Backend selection: smooth weighted round robin assigns traffic by configured
+// weights and skips targets excluded by health checks. Start at next; the lock
+// protects selection scores and is released before network I/O.
+
 package main
 
 import (
@@ -17,6 +21,8 @@ type balancer struct {
 	backends []backend
 }
 
+// newBalancer turns validated destinations into eligible targets and initial scores.
+// Ordinary round robin treats every target as weight one.
 func newBalancer(config UpstreamConfig) *balancer {
 	b := &balancer{}
 	if config.URL != "" {
@@ -34,6 +40,8 @@ func newBalancer(config UpstreamConfig) *balancer {
 	return b
 }
 
+// next selects one eligible backend, or returns nil when none remain. Updating the
+// scores and choosing the winner happen together so concurrent requests preserve the ratio.
 func (b *balancer) next() *url.URL {
 	b.mu.Lock()
 	defer b.mu.Unlock()

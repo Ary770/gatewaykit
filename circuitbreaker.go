@@ -1,3 +1,7 @@
+// Route-level failure protection: completed request failures can open the circuit
+// and temporarily reject traffic. After cooldown, one request tests recovery.
+// Start at admit and finish; background health checks do not change breaker state.
+
 package main
 
 import (
@@ -34,6 +38,7 @@ type breakerPermit struct {
 	once       sync.Once
 }
 
+// newCircuitBreaker prepares the route failure policy, or disables it when absent.
 func newCircuitBreaker(c *CircuitBreakerConfig) *circuitBreaker {
 	if c == nil {
 		return nil
@@ -43,6 +48,7 @@ func newCircuitBreaker(c *CircuitBreakerConfig) *circuitBreaker {
 	return &circuitBreaker{threshold: c.Threshold, window: window, cooldown: cooldown}
 }
 
+// clock prevents delayed concurrent completions from moving the rolling-window time backward.
 func (b *circuitBreaker) clock(now time.Time) time.Time {
 	if now.Before(b.last) {
 		return b.last
@@ -72,6 +78,9 @@ func (b *circuitBreaker) admit(now time.Time) (*breakerPermit, time.Duration) {
 	return &breakerPermit{breaker: b, generation: b.generation, probe: b.open}, 0
 }
 
+// finish records exactly one logical request outcome. Neutral outcomes release a
+// recovery probe without blaming the backend; generation checks ignore results from
+// a previous breaker state so late responses cannot undo a newer transition.
 func (p *breakerPermit) finish(outcome breakerOutcome, now time.Time) {
 	p.once.Do(func() {
 		b := p.breaker

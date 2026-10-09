@@ -1,3 +1,6 @@
+// Application lifecycle: load validated settings, prepare the reusable HTTP sender,
+// start the gateway listener, and drain requests on shutdown. Read run first.
+
 package main
 
 import (
@@ -14,6 +17,7 @@ import (
 	"time"
 )
 
+// main turns OS shutdown signals into cancellation and reports startup/runtime errors.
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -23,6 +27,8 @@ func main() {
 	}
 }
 
+// run owns startup and cleanup. The shared transport sends HTTP requests and reuses
+// backend connections; the server accepts client requests and calls Gateway.ServeHTTP.
 func run(ctx context.Context, args []string, configEnv string) error {
 	flags := flag.NewFlagSet("gatewaykit", flag.ContinueOnError)
 	path := flags.String("config", "", "path to gateway YAML (also accepts GATEWAY_CONFIG or one positional path)")

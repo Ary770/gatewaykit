@@ -18,6 +18,7 @@ import (
 	"time"
 )
 
+// main selects local demo ports and stops all mock services on OS shutdown signals.
 func main() {
 	ports := flag.String("ports", "3001,3002,3003,3004,3005,3006", "comma-separated loopback ports")
 	flag.Parse()
@@ -29,6 +30,8 @@ func main() {
 	}
 }
 
+// serve binds every loopback listener before starting services and closes all listeners
+// on startup failure or shutdown. These are separate HTTP endpoints, not gateway policies.
 func serve(ctx context.Context, ports string) error {
 	var listeners []net.Listener
 	defer func() {
@@ -69,6 +72,8 @@ func serve(ctx context.Context, ports string) error {
 	}
 }
 
+// mockHandler supplies deterministic echo, delay, status, and health responses.
+// Business behavior is mocked, but the gateway reaches this handler over real HTTP.
 func mockHandler(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

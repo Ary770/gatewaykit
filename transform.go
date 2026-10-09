@@ -1,3 +1,7 @@
+// Configured representation changes: edit headers, map request JSON fields, and
+// wrap the final backend JSON response in an envelope. Header-only rules stream;
+// body rules buffer within 1 MiB. Start at transformRequest and transformResponse.
+
 package main
 
 import (
@@ -33,6 +37,7 @@ type ResponseTransformBody struct {
 }
 type transformValues struct{ requestTime, responseTime, route string }
 
+// transformExpression resolves the supported metadata/body tokens; it never evaluates code.
 func transformExpression(s string, v transformValues, body any) any {
 	switch s {
 	case "$request_time":
@@ -116,6 +121,9 @@ func validateEnvelope(v any) error {
 	}
 	return nil
 }
+
+// validateTransforms checks header rules, expressions, and conflicting mapping paths
+// at startup so invalid rewrite instructions cannot first appear during a request.
 func validateTransforms(r RouteConfig) error {
 	if c := r.RequestTransform; c != nil {
 		for _, value := range c.Headers.Add {
@@ -165,6 +173,8 @@ func validateTransforms(r RouteConfig) error {
 	}
 	return nil
 }
+
+// applyTransformHeaders removes configured names, then adds resolved header values.
 func applyTransformHeaders(h http.Header, c TransformHeaders, v transformValues) {
 	for _, k := range c.Remove {
 		h.Del(k)
@@ -173,6 +183,9 @@ func applyTransformHeaders(h http.Header, c TransformHeaders, v transformValues)
 		h.Set(k, transformExpression(value, v, nil).(string))
 	}
 }
+
+// transformJSON reads bounded identity-encoded JSON, requires one value, and preserves
+// numeric text with UseNumber. Its status describes a client-side validation failure.
 func transformJSON(reader io.Reader, h http.Header) (any, int, error) {
 	data, err := io.ReadAll(io.LimitReader(reader, transformBodyLimit+1))
 	if err != nil {
@@ -203,6 +216,9 @@ func transformJSON(reader io.Reader, h http.Header) (any, int, error) {
 	}
 	return result, 200, nil
 }
+
+// cleanRepresentationHeaders discards metadata that described the old bytes,
+// such as length, compression, checksums, and cache validators, after JSON rewriting.
 func cleanRepresentationHeaders(h http.Header) {
 	for _, k := range []string{"Content-Length", "Content-Encoding", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest", "ETag", "Last-Modified", "Content-Range", "Accept-Ranges"} {
 		h.Del(k)
@@ -274,6 +290,8 @@ func transformedJSONSize(v any, remaining int) (int, error) {
 	return size, nil
 }
 
+// encodeTransformed checks output expansion before allocating the encoded body
+// and clears metadata that no longer matches its bytes.
 func encodeTransformed(v any, h http.Header) ([]byte, error) {
 	if _, err := transformedJSONSize(v, transformBodyLimit); err != nil {
 		return nil, err
@@ -288,6 +306,9 @@ func encodeTransformed(v any, h http.Header) ([]byte, error) {
 	cleanRepresentationHeaders(h)
 	return b, nil
 }
+
+// mappedBody replaces the request object using destination/source dot paths.
+// Missing source fields become null; expressions can supply metadata or literal values.
 func mappedBody(input map[string]any, mapping map[string]string, v transformValues) map[string]any {
 	out := map[string]any{}
 	for dest, src := range mapping {
@@ -317,6 +338,9 @@ func mappedBody(input map[string]any, mapping map[string]string, v transformValu
 	}
 	return out
 }
+
+// envelopeBody recursively builds the configured response wrapper, substituting
+// $body with the parsed final backend response and resolving metadata tokens.
 func envelopeBody(value any, v transformValues, body any) any {
 	switch x := value.(type) {
 	case string:
@@ -337,6 +361,9 @@ func envelopeBody(value any, v transformValues, body any) any {
 		return value
 	}
 }
+
+// transformRequest applies request rules once before any backend attempt.
+// Empty bodies stay empty; JSON mapping replaces the body and updates its length.
 func (g *Gateway) transformRequest(out *http.Request, r *route, v transformValues) (int, error) {
 	c := r.config.RequestTransform
 	if c == nil {
@@ -376,6 +403,9 @@ func (g *Gateway) transformRequest(out *http.Request, r *route, v transformValue
 	}
 	return 0, nil
 }
+
+// transformResponse rewrites only the final backend response. HEAD, 204, and 304
+// retain their bodyless semantics; header-only rules leave the body streamed.
 func (g *Gateway) transformResponse(response *http.Response, req *http.Request, r *route, v transformValues) error {
 	c := r.config.ResponseTransform
 	if c == nil {

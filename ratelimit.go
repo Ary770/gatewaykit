@@ -1,3 +1,7 @@
+// Route-owned quota accounting: a bucket stores counts or accepted timestamps for
+// one client identity (or all clients). Start at allow; its lock covers only bookkeeping,
+// never the backend exchange. State is local to this process.
+
 package main
 
 import (
@@ -31,6 +35,7 @@ type rateLimiter struct {
 	capacity       int
 }
 
+// newRateLimiter prepares the route quota, or returns nil when no limit is configured.
 func newRateLimiter(config *RateLimitConfig) *rateLimiter {
 	if config == nil {
 		return nil
@@ -67,6 +72,7 @@ func (limiter *rateLimiter) monotonicEvaluationTime(now time.Time) time.Time {
 	return now
 }
 
+// bucketKey chooses a shared route bucket for global limits or the supplied client identity.
 func (limiter *rateLimiter) bucketKey(clientKey string) string {
 	if limiter.config.Per == "global" {
 		return "global"
@@ -74,6 +80,7 @@ func (limiter *rateLimiter) bucketKey(clientKey string) string {
 	return clientKey
 }
 
+// removeExpiredBuckets periodically reclaims idle identities without a cleanup goroutine.
 func (limiter *rateLimiter) removeExpiredBuckets(now time.Time) {
 	if now.Before(limiter.nextCleanup) {
 		return
@@ -87,6 +94,7 @@ func (limiter *rateLimiter) removeExpiredBuckets(now time.Time) {
 	limiter.nextCleanup = now.Add(cleanupInterval)
 }
 
+// findOrCreateBucket retains existing clients and refuses new identities at the memory cap.
 func (limiter *rateLimiter) findOrCreateBucket(key string, now time.Time) *rateBucket {
 	if bucket := limiter.buckets[key]; bucket != nil {
 		return bucket
@@ -99,6 +107,8 @@ func (limiter *rateLimiter) findOrCreateBucket(key string, now time.Time) *rateB
 	return bucket
 }
 
+// allowFixedWindow counts accepted requests in a period beginning with the first acceptance.
+// A denial returns the remaining wait without increasing the count.
 func (limiter *rateLimiter) allowFixedWindow(bucket *rateBucket, now time.Time) rateLimitDecision {
 	if !now.Before(bucket.windowStart.Add(limiter.window)) {
 		bucket.windowStart = now
@@ -111,6 +121,8 @@ func (limiter *rateLimiter) allowFixedWindow(bucket *rateBucket, now time.Time) 
 	return rateLimitDecision{allowed: true}
 }
 
+// allowSlidingWindow counts accepted timestamps in (now - window, now].
+// A denial waits for the oldest retained acceptance to expire.
 func (limiter *rateLimiter) allowSlidingWindow(bucket *rateBucket, now time.Time) rateLimitDecision {
 	bucket.discardRequestsThrough(now.Add(-limiter.window))
 	if len(bucket.acceptedAt) >= limiter.config.Requests {
@@ -120,6 +132,7 @@ func (limiter *rateLimiter) allowSlidingWindow(bucket *rateBucket, now time.Time
 	return rateLimitDecision{allowed: true}
 }
 
+// discardRequestsThrough removes timestamps at or before the exclusive window boundary.
 func (bucket *rateBucket) discardRequestsThrough(cutoff time.Time) {
 	expiredCount := 0
 	for expiredCount < len(bucket.acceptedAt) && !bucket.acceptedAt[expiredCount].After(cutoff) {
@@ -128,6 +141,7 @@ func (bucket *rateBucket) discardRequestsThrough(cutoff time.Time) {
 	bucket.acceptedAt = bucket.acceptedAt[expiredCount:]
 }
 
+// bucketExpired identifies state that cannot affect any future quota decision.
 func (limiter *rateLimiter) bucketExpired(bucket *rateBucket, now time.Time) bool {
 	if limiter.config.Strategy == "fixed_window" {
 		return !now.Before(bucket.windowStart.Add(limiter.window))

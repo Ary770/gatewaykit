@@ -1,3 +1,6 @@
+// Startup configuration boundary: decode YAML into typed settings, fill defaults,
+// and reject invalid routes or policies before accepting traffic. Start at loadConfig.
+
 package main
 
 import (
@@ -48,6 +51,7 @@ type CircuitBreakerConfig struct {
 	Cooldown  string `yaml:"cooldown"`
 }
 
+// validateCircuitBreaker bounds the failure threshold and checks the two time periods.
 func validateCircuitBreaker(c *CircuitBreakerConfig) error {
 	if c == nil {
 		return nil
@@ -89,6 +93,7 @@ type AuthConfig struct {
 	Keys   []string `yaml:"keys"`
 }
 
+// loadConfig opens the selected file and delegates parsing and validation to decodeConfig.
 func loadConfig(path string) (Config, []string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -98,6 +103,7 @@ func loadConfig(path string) (Config, []string, error) {
 	return decodeConfig(f)
 }
 
+// decodeConfig accepts exactly one YAML document, rejects unknown fields, and validates it.
 func decodeConfig(r io.Reader) (Config, []string, error) {
 	var c Config
 	decoder := yaml.NewDecoder(r)
@@ -113,6 +119,8 @@ func decodeConfig(r io.Reader) (Config, []string, error) {
 	return c, warnings, err
 }
 
+// validate resolves defaults in place and checks every route, including overlapping
+// method/path definitions. Later request handling can rely on these validated settings.
 func (c *Config) validate() ([]string, error) {
 	if c.Gateway.Port == 0 {
 		c.Gateway.Port = 8080
@@ -215,6 +223,7 @@ func (c *Config) validate() ([]string, error) {
 	return nil, nil
 }
 
+// validateLimit checks quota size, duration, counting strategy, and client grouping.
 func validateLimit(c *RateLimitConfig) error {
 	if c == nil {
 		return nil
@@ -234,6 +243,7 @@ func validateLimit(c *RateLimitConfig) error {
 	return nil
 }
 
+// duration parses a strictly positive Go duration, such as 500ms or 30s.
 func duration(s string) (time.Duration, error) {
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
@@ -242,6 +252,7 @@ func duration(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// validateURL restricts destinations to HTTP(S) URLs without credentials or fragments.
 func validateURL(s string) error {
 	u, err := url.Parse(s)
 	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Fragment != "" {
