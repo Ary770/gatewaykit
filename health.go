@@ -1,6 +1,6 @@
-// Background target health: independent GET probes change which backends the
-// balancer may select. This differs from gateway /health (process liveness) and
-// circuit breaking (client-request failures). Start at startHealthChecks.
+// Checks backends in the background and removes unhealthy ones from selection.
+// One successful check makes a backend available again. This is separate from
+// /health, which reports that the gateway itself is running. Start with startHealthChecks.
 
 package main
 
@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// validateHealthCheck checks the origin-relative probe path and timing, defaulting
-// the exclusion threshold to one consecutive failure when omitted.
+// validateHealthCheck checks the health URL path and timing settings.
+// If no failure count is given, one failed check marks the backend unhealthy.
 func validateHealthCheck(c *HealthCheckConfig) error {
 	if c == nil {
 		return nil
@@ -37,8 +37,8 @@ func validateHealthCheck(c *HealthCheckConfig) error {
 	return nil
 }
 
-// startHealthChecks is explicitly owned by run after binding the listener.
-// The returned stop function cancels in-flight probes and joins every worker.
+// startHealthChecks starts checks after run has opened the server port.
+// The returned stop function cancels the checks and waits for all of them to finish.
 func (g *Gateway) startHealthChecks(parent context.Context) func() {
 	ctx, cancel := context.WithCancel(parent)
 	var workers sync.WaitGroup
@@ -57,8 +57,8 @@ func (g *Gateway) startHealthChecks(parent context.Context) func() {
 	return func() { cancel(); workers.Wait() }
 }
 
-// monitorBackend probes one target without overlapping checks. Consecutive failures
-// exclude it; one successful probe restores it. Waiting and probing both honor shutdown.
+// monitorBackend checks one backend at a time. Repeated failures mark it unhealthy;
+// one success restores it. Stopping the app cancels the check or its waiting time.
 func (g *Gateway) monitorBackend(ctx context.Context, selectedRoute *route, backendIndex int) {
 	policy := selectedRoute.config.HealthCheck
 	interval, _ := duration(policy.Interval)
@@ -85,7 +85,7 @@ func (g *Gateway) monitorBackend(ctx context.Context, selectedRoute *route, back
 	}
 }
 
-// healthProbeURL keeps the target origin but replaces its path/query with the probe path.
+// healthProbeURL keeps the backend scheme, host, and port, but uses the health-check path and query.
 func healthProbeURL(target *url.URL, path string) *url.URL {
 	endpoint := *target
 	probePath, _ := url.Parse(path)
@@ -94,13 +94,13 @@ func healthProbeURL(target *url.URL, path string) *url.URL {
 	return &endpoint
 }
 
-// probeBackend bounds one GET and treats received 2xx/3xx headers as healthy.
-// It does not follow redirects or read an unbounded response body.
+// probeBackend sends one GET within a time limit. Status 200-399 means healthy.
+// It does not follow redirects or wait to read the entire response body.
 func (g *Gateway) probeBackend(parent context.Context, endpoint *url.URL, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	// RoundTrip does not follow redirects; header receipt defines probe success.
+	// RoundTrip does not follow redirects. Receiving response headers is enough for this check.
 	response, err := g.transport.RoundTrip(request)
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
@@ -108,7 +108,7 @@ func (g *Gateway) probeBackend(parent context.Context, endpoint *url.URL, timeou
 	return err == nil && response.StatusCode >= 200 && response.StatusCode < 400
 }
 
-// updateBackendHealth changes eligibility through the balancer lock and logs transitions only.
+// updateBackendHealth safely changes backend availability and logs only changes.
 func updateBackendHealth(selectedRoute *route, backendIndex int, healthy bool) {
 	if !selectedRoute.balancer.setHealthy(backendIndex, healthy) {
 		return
@@ -117,7 +117,7 @@ func updateBackendHealth(selectedRoute *route, backendIndex int, healthy bool) {
 	slog.Info("upstream health changed", "route", selectedRoute.config.Path, "target", target.Host, "healthy", healthy)
 }
 
-// waitForHealthInterval waits after a probe finishes and wakes immediately on shutdown.
+// waitForHealthInterval waits between checks and stops waiting when the app shuts down.
 func waitForHealthInterval(ctx context.Context, interval time.Duration) bool {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()

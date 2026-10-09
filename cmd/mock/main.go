@@ -1,4 +1,5 @@
-// Command mock starts local-only upstreams for GatewayKit demonstrations.
+// Starts local demo backends that return predictable test responses.
+// The responses are mocked, but the gateway calls these servers over real HTTP.
 package main
 
 import (
@@ -18,7 +19,7 @@ import (
 	"time"
 )
 
-// main selects local demo ports and stops all mock services on OS shutdown signals.
+// main reads the demo ports and stops the servers when the app is told to exit.
 func main() {
 	ports := flag.String("ports", "3001,3002,3003,3004,3005,3006", "comma-separated loopback ports")
 	flag.Parse()
@@ -30,8 +31,8 @@ func main() {
 	}
 }
 
-// serve binds every loopback listener before starting services and closes all listeners
-// on startup failure or shutdown. These are separate HTTP endpoints, not gateway policies.
+// serve opens all demo ports before starting the servers. It closes every port
+// if startup fails or the app stops.
 func serve(ctx context.Context, ports string) error {
 	var listeners []net.Listener
 	defer func() {
@@ -72,8 +73,7 @@ func serve(ctx context.Context, ports string) error {
 	}
 }
 
-// mockHandler supplies deterministic echo, delay, status, and health responses.
-// Business behavior is mocked, but the gateway reaches this handler over real HTTP.
+// mockHandler echoes requests or returns a chosen delay, status, or health response.
 func mockHandler(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

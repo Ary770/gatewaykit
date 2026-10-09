@@ -1,6 +1,6 @@
-// Backend selection: smooth weighted round robin assigns traffic by configured
-// weights and skips targets excluded by health checks. Start at next; the lock
-// protects selection scores and is released before network I/O.
+// Chooses a backend for each request. Higher weights receive more requests.
+// Unhealthy backends are skipped. Start with next. The lock protects the choice
+// and scores; it is released before sending an HTTP request.
 
 package main
 
@@ -21,8 +21,8 @@ type balancer struct {
 	backends []backend
 }
 
-// newBalancer turns validated destinations into eligible targets and initial scores.
-// Ordinary round robin treats every target as weight one.
+// newBalancer reads the backend addresses and starts their scores at zero.
+// For ordinary round robin, all backends have the same weight.
 func newBalancer(config UpstreamConfig) *balancer {
 	b := &balancer{}
 	if config.URL != "" {
@@ -40,13 +40,13 @@ func newBalancer(config UpstreamConfig) *balancer {
 	return b
 }
 
-// next selects one eligible backend, or returns nil when none remain. Updating the
-// scores and choosing the winner happen together so concurrent requests preserve the ratio.
+// next picks an available backend, or returns nil if all are unhealthy.
+// It updates scores under a lock so simultaneous requests keep the configured ratio.
 func (b *balancer) next() *url.URL {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Smooth weighted round robin distributes traffic without allocating a list
-	// proportional to the weights. Equal weights give ordinary round robin.
+	// Use scores to spread requests by weight without storing repeated backend entries.
+	// Equal weights make the backends take turns.
 	best := -1
 	total := int64(0)
 	for i := range b.backends {
@@ -67,7 +67,8 @@ func (b *balancer) next() *url.URL {
 	return b.backends[best].url
 }
 
-// setHealthy resets accumulated credits so a recovering target cannot monopolize traffic.
+// setHealthy changes whether a backend can receive requests. It resets scores
+// so a backend that returns to service does not get a sudden burst of traffic.
 func (b *balancer) setHealthy(index int, healthy bool) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -1,6 +1,6 @@
-// Safe request replay: prepare bytes once, retry selected failures with backoff
-// (a delay between attempts), and expose only the final response. All attempts
-// share one deadline, one quota charge, and one circuit-breaker outcome.
+// Tries selected failures again after a delay. Saves the request body once
+// and returns only the final response. All attempts share one time limit,
+// one place in the request count, and one result for the circuit breaker.
 
 package main
 
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// Attempts includes the first request. Only idempotent methods are replayed.
+// Attempts includes the first send. Retry only methods intended to have the same effect when repeated.
 type RetryConfig struct {
 	Attempts     int    `yaml:"attempts"`
 	Backoff      string `yaml:"backoff"`
@@ -29,7 +29,7 @@ const maxReplayBodyBytes = 1 << 20
 var errReplayBodyTooLarge = errors.New("retry request body exceeds 1 MiB")
 var errNoHealthyBackends = errors.New("no healthy upstreams")
 
-// validateRetry bounds total attempts and validates the delay strategy and retryable statuses.
+// validateRetry checks the total attempt count, delay settings, and retryable HTTP statuses.
 func validateRetry(c *RetryConfig) error {
 	if c == nil {
 		return nil
@@ -56,8 +56,8 @@ func validateRetry(c *RetryConfig) error {
 	return nil
 }
 
-// retryableMethod permits methods whose HTTP semantics allow repetition without
-// additional intended effects. POST/PATCH remain single-attempt even with an idempotency key.
+// retryableMethod allows retries for HTTP methods intended to have the same effect when repeated.
+// POST/PATCH are sent once, even if the client provides an idempotency key.
 func retryableMethod(method string) bool {
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
@@ -67,15 +67,15 @@ func retryableMethod(method string) bool {
 	}
 }
 
-// Buffer before sending so a partial upload can never be mistaken for a replay.
-// Requests without an applicable retry policy keep their streaming behavior.
+// prepareRetry saves the full body before sending, so a retry cannot reuse an incomplete upload.
+// Requests that will not be retried keep sending their bodies as they are read.
 func prepareRetry(req *http.Request, c *RetryConfig) (int, error) {
 	if err := req.Context().Err(); err != nil {
 		return 0, err
 	}
 	if !retryableMethod(req.Method) {
-		// A body transform must not make an unsafe upload newly replayable by
-		// net/http just because the client supplied an idempotency header.
+		// Changing the body must not enable automatic retries of POST/PATCH
+		// just because the client supplied an idempotency header.
 		req.GetBody = nil
 		return 1, nil
 	}
@@ -111,7 +111,7 @@ func (c *RetryConfig) includes(status int) bool {
 	return false
 }
 
-// retryNumber is one for the wait before the second attempt.
+// retryNumber 1 means the wait before attempt 2.
 func (c *RetryConfig) delay(retryNumber int) time.Duration {
 	delay, _ := duration(c.InitialDelay)
 	if c.Backoff == "exponential" {
@@ -125,7 +125,7 @@ func (c *RetryConfig) delay(retryNumber int) time.Duration {
 	return delay
 }
 
-// waitBackoff delays the next attempt while allowing cancellation to stop the wait.
+// waitBackoff waits before retrying and stops immediately if the request is canceled.
 func waitBackoff(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -137,8 +137,9 @@ func waitBackoff(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-// Only the final response escapes this function. Discarded responses are closed
-// before waiting, and every attempt shares the original request deadline.
+// roundTripAttempts sends requests until one succeeds, cannot be retried, or uses the last attempt.
+// It closes unused responses before waiting. Only the final response is returned,
+// and all attempts must finish within the original time limit.
 func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.URL, target *url.URL, attempts int, c *RetryConfig) (*http.Response, error) {
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := out.Context().Err(); err != nil {
@@ -184,8 +185,8 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 	panic("retry attempts must be positive")
 }
 
-// upstreamErrorStatus distinguishes deadline/timeout failures (504) from other
-// transport failures (502), consulting the shared deadline when cancellation signals race.
+// upstreamErrorStatus returns 504 for a timeout, otherwise 502 for a connection error.
+// It also checks the time limit because timeout and cancellation can be reported in either order.
 func upstreamErrorStatus(err error, ctx context.Context) int {
 	var netErr net.Error
 	deadline, hasDeadline := ctx.Deadline()

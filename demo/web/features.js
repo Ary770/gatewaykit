@@ -1,4 +1,4 @@
-// Every scenario calls the real gateway; summaries retain the actual responses.
+// Each example calls the gateway and shows the responses it actually received.
 function requireDemoResult(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -41,7 +41,7 @@ async function demonstrateHealthChecks() {
 }
 
 async function demonstrateCircuitBreaker() {
-  // A previous click may have left the circuit open. Wait, then establish recovery.
+  // A previous click may have left requests blocked. Wait, then send one request to restore service.
   await new Promise(resolve => setTimeout(resolve, 3200));
   const initial = await request('/breaker/echo');
   requireDemoResult(initial.status === 200, 'Circuit did not recover before the scenario');

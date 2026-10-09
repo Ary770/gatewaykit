@@ -1,6 +1,6 @@
-// Route-owned quota accounting: a bucket stores counts or accepted timestamps for
-// one client identity (or all clients). Start at allow; its lock covers only bookkeeping,
-// never the backend exchange. State is local to this process.
+// Counts allowed requests for each client IP, or for all clients of a route.
+// Start with allow. A lock keeps simultaneous requests from updating the count
+// at the same time. Counts are kept in memory and reset when the app restarts.
 
 package main
 
@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// The cap bounds identity growth from unauthenticated traffic. Existing clients
-// keep their buckets; new identities fail closed until expired buckets are swept.
+// Keep at most this many client counts in memory. Existing clients keep their
+// counts; new clients are rejected until old counts are removed.
 const maxRateLimitBuckets = 10000
 
 type rateLimitDecision struct {
@@ -35,7 +35,7 @@ type rateLimiter struct {
 	capacity       int
 }
 
-// newRateLimiter prepares the route quota, or returns nil when no limit is configured.
+// newRateLimiter creates the request counters, or returns nil if no limit is configured.
 func newRateLimiter(config *RateLimitConfig) *rateLimiter {
 	if config == nil {
 		return nil
@@ -44,8 +44,8 @@ func newRateLimiter(config *RateLimitConfig) *rateLimiter {
 	return &rateLimiter{config: *config, window: window, buckets: make(map[string]*rateBucket), capacity: maxRateLimitBuckets}
 }
 
-// allow atomically checks and charges one accepted request. All stateful helpers
-// run under this lock so cleanup, capacity checks, and quota updates cannot race.
+// allow checks if the request is allowed. If yes, it adds one to the request count.
+// The lock keeps the check and update together so two requests cannot take the last slot.
 func (limiter *rateLimiter) allow(clientKey string, now time.Time) rateLimitDecision {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
@@ -63,8 +63,8 @@ func (limiter *rateLimiter) allow(clientKey string, now time.Time) rateLimitDeci
 }
 
 func (limiter *rateLimiter) monotonicEvaluationTime(now time.Time) time.Time {
-	// A caller can capture time, then acquire the lock after a later caller.
-	// Clamping keeps sliding-window timestamps ordered under contention.
+	// A request can record its time but reach the lock after a later request.
+	// Keep time from moving backward so saved request times stay in order.
 	if now.Before(limiter.lastEvaluation) {
 		return limiter.lastEvaluation
 	}
@@ -72,7 +72,7 @@ func (limiter *rateLimiter) monotonicEvaluationTime(now time.Time) time.Time {
 	return now
 }
 
-// bucketKey chooses a shared route bucket for global limits or the supplied client identity.
+// bucketKey uses one shared count for a global limit, or a separate count for each client.
 func (limiter *rateLimiter) bucketKey(clientKey string) string {
 	if limiter.config.Per == "global" {
 		return "global"
@@ -80,7 +80,7 @@ func (limiter *rateLimiter) bucketKey(clientKey string) string {
 	return clientKey
 }
 
-// removeExpiredBuckets periodically reclaims idle identities without a cleanup goroutine.
+// removeExpiredBuckets removes old client counts periodically while processing requests.
 func (limiter *rateLimiter) removeExpiredBuckets(now time.Time) {
 	if now.Before(limiter.nextCleanup) {
 		return
@@ -94,7 +94,8 @@ func (limiter *rateLimiter) removeExpiredBuckets(now time.Time) {
 	limiter.nextCleanup = now.Add(cleanupInterval)
 }
 
-// findOrCreateBucket retains existing clients and refuses new identities at the memory cap.
+// findOrCreateBucket finds a client count or creates one. It refuses new clients
+// when the table reaches its size limit; existing clients can still use their counts.
 func (limiter *rateLimiter) findOrCreateBucket(key string, now time.Time) *rateBucket {
 	if bucket := limiter.buckets[key]; bucket != nil {
 		return bucket
@@ -107,8 +108,8 @@ func (limiter *rateLimiter) findOrCreateBucket(key string, now time.Time) *rateB
 	return bucket
 }
 
-// allowFixedWindow counts accepted requests in a period beginning with the first acceptance.
-// A denial returns the remaining wait without increasing the count.
+// allowFixedWindow starts a counting period with the first allowed request.
+// Once full, it rejects requests until that period ends, without increasing the count.
 func (limiter *rateLimiter) allowFixedWindow(bucket *rateBucket, now time.Time) rateLimitDecision {
 	if !now.Before(bucket.windowStart.Add(limiter.window)) {
 		bucket.windowStart = now
@@ -121,8 +122,8 @@ func (limiter *rateLimiter) allowFixedWindow(bucket *rateBucket, now time.Time) 
 	return rateLimitDecision{allowed: true}
 }
 
-// allowSlidingWindow counts accepted timestamps in (now - window, now].
-// A denial waits for the oldest retained acceptance to expire.
+// allowSlidingWindow counts allowed requests within the most recent time period.
+// At the limit, it returns the wait until the oldest counted request expires.
 func (limiter *rateLimiter) allowSlidingWindow(bucket *rateBucket, now time.Time) rateLimitDecision {
 	bucket.discardRequestsThrough(now.Add(-limiter.window))
 	if len(bucket.acceptedAt) >= limiter.config.Requests {
@@ -132,7 +133,7 @@ func (limiter *rateLimiter) allowSlidingWindow(bucket *rateBucket, now time.Time
 	return rateLimitDecision{allowed: true}
 }
 
-// discardRequestsThrough removes timestamps at or before the exclusive window boundary.
+// discardRequestsThrough removes request times at or before the cutoff; they no longer count.
 func (bucket *rateBucket) discardRequestsThrough(cutoff time.Time) {
 	expiredCount := 0
 	for expiredCount < len(bucket.acceptedAt) && !bucket.acceptedAt[expiredCount].After(cutoff) {
@@ -141,7 +142,7 @@ func (bucket *rateBucket) discardRequestsThrough(cutoff time.Time) {
 	bucket.acceptedAt = bucket.acceptedAt[expiredCount:]
 }
 
-// bucketExpired identifies state that cannot affect any future quota decision.
+// bucketExpired checks whether a client count is too old to affect the limit.
 func (limiter *rateLimiter) bucketExpired(bucket *rateBucket, now time.Time) bool {
 	if limiter.config.Strategy == "fixed_window" {
 		return !now.Before(bucket.windowStart.Add(limiter.window))
