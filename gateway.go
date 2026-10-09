@@ -1,5 +1,5 @@
 // Follow a request through ServeHTTP, forward, and forwardPreparedRequest.
-// roundTripAttempts in retry.go sends it to the backend; the response returns here.
+// retry.go sends it to the backend; response.go returns the response to the client.
 
 package main
 
@@ -222,10 +222,8 @@ func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Reques
 	return attempts, true
 }
 
-// forwardPreparedRequest chooses a backend and checks the circuit breaker.
-// It sends the request, applies response changes, and sends the response to the client.
-// The circuit breaker records one result after response handling finishes.
-// Client upload errors and canceled requests do not count as backend failures.
+// forwardPreparedRequest chooses a backend, checks the breaker, and sends the request.
+// response.go handles the response. Record the breaker result after that work finishes.
 func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.Request, r *route, values transformValues, attempts int, deadline time.Time) {
 	// Choose a backend that is currently marked healthy.
 	target := r.balancer.next()
@@ -257,61 +255,16 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 	// Send through retry.go; get the final backend response or a sending error.
 	response, err := g.roundTripAttempts(out, r, req.URL, target, attempts, r.config.Retry)
 	if err != nil {
-		if errors.Is(err, errNoHealthyBackends) {
-			writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
-			return
-		}
-		outcome = breakerFailure
-		status, message := http.StatusBadGateway, "bad_gateway"
-		// Check the clock too; a client read timeout can cancel the request first.
-		if upstreamErrorStatus(err, out.Context()) == http.StatusGatewayTimeout {
-			status, message = http.StatusGatewayTimeout, "gateway_timeout"
-			// Close this client connection; it cannot be reused after a read timeout.
-			w.Header().Set("Connection", "close")
-		}
-		slog.Warn("upstream request failed", "route", r.config.Path, "category", message)
-		writeError(w, status, message)
+		outcome = writeUpstreamError(w, out.Context(), r.config.Path, err)
 		return
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusSwitchingProtocols {
-		outcome = breakerFailure
-		writeError(w, http.StatusBadGateway, "unsupported_protocol_upgrade")
-		return
-	}
-	body := &observedUpstreamBody{ReadCloser: response.Body}
-	response.Body = body
-	removeHopHeaders(response.Header)
-	// Apply configured response changes before sending the response to the client.
-	if err := g.transformResponse(response, req, r, values); err != nil {
-		if body.failed || response.StatusCode >= 500 {
-			outcome = breakerFailure
-		}
-		status := http.StatusBadGateway
-		if !time.Now().Before(deadline) || errors.Is(out.Context().Err(), context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-			w.Header().Set("Connection", "close")
-		}
-		writeError(w, status, "response_transform_failed")
-		return
-	}
-	removeHopHeaders(response.Header)
-	// Return the final headers and status, then copy the response body to the client.
-	for key, values := range response.Header {
-		w.Header()[key] = append([]string(nil), values...)
-	}
-	w.WriteHeader(response.StatusCode)
-	if _, err := io.Copy(w, response.Body); err != nil {
-		if body.failed {
-			outcome = breakerFailure
-		}
+	// Return the response and record its result before handling an interrupted body.
+	outcome, err = g.relayUpstreamResponse(w, req, r, response, values, out.Context(), deadline)
+	if err != nil {
 		// The response has started; close the connection to show that the body is incomplete.
 		slog.Warn("upstream response interrupted", "route", r.config.Path)
 		panic(http.ErrAbortHandler)
-	}
-	outcome = breakerSuccess
-	if response.StatusCode >= 500 {
-		outcome = breakerFailure
 	}
 }
 

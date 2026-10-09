@@ -71,7 +71,9 @@ Start at `ServeHTTP`.
 
 Then show `match` and `forward`.
 
-`forward` reads in three stages: clone and sanitize the outgoing request, prepare transformations and retry replay, then run the backend exchange. The shared deadline surrounds all three stages. `forwardPreparedRequest` keeps circuit-breaker accounting around the full exchange, including response streaming, so a broken backend response and a disconnected client are classified differently.
+`forward` copies the client request, applies configured changes, and prepares its body for retries when needed. All of this uses one time limit. `forwardPreparedRequest` chooses a backend, checks the circuit breaker, and sends the request through `roundTripAttempts` in `retry.go`.
+
+Then open [response.go](response.go). `writeUpstreamError` handles sending errors. `relayUpstreamResponse` applies response changes and calls `copyUpstreamResponse` to send the headers, status, and body. The main function records the circuit-breaker result after response handling finishes. A broken backend body counts as a failure; a failed client upload or client write does not.
 
 > The most specific matching route wins. `/api/users` matches `/api/users/123`, but it doesn't match `/api/users-extra`.
 >
@@ -179,7 +181,8 @@ You don't need to explain every syntax detail up front. Start with what the requ
 
 - `main.go` starts and stops the server and health workers.
 - `config.go` turns YAML into validated settings.
-- `gateway.go` follows one request from route checks to the backend and back.
+- `gateway.go` checks the route and coordinates the request to the backend.
+- `response.go` handles backend errors, response changes, and sending the response to the client.
 - `ratelimit.go`, `balancer.go`, and `circuitbreaker.go` own their separate state and locks.
 - `retry.go` owns attempts and backoff under the original deadline.
 - `transform.go` owns header and bounded JSON changes.
