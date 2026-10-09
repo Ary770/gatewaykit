@@ -92,6 +92,7 @@ func newUpstreamTransport() *http.Transport {
 // The server calls Gateway.ServeHTTP for every incoming request.
 func serveGateway(ctx context.Context, gateway *Gateway, port int) error {
 	server := &http.Server{
+		// Go calls gateway.ServeHTTP for each request received on this port.
 		Addr: fmt.Sprintf(":%d", port), Handler: gateway,
 		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 1 << 20,

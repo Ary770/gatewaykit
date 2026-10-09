@@ -146,6 +146,7 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 			return nil, err
 		}
 		if attempt > 0 {
+			// Wait before retrying, then choose a currently healthy backend.
 			if err := waitBackoff(out.Context(), c.delay(attempt)); err != nil {
 				return nil, err
 			}
@@ -154,16 +155,19 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 		if target == nil {
 			return nil, errNoHealthyBackends
 		}
+		// Build the backend URL, keeping the query and applying prefix removal if enabled.
 		request := out.Clone(out.Context())
 		request.URL = upstreamURL(incoming, target, r)
 		request.Host = target.Host
 		if attempt > 0 && out.GetBody != nil {
+			// Give this retry a fresh reader for the same saved request body.
 			var err error
 			request.Body, err = out.GetBody()
 			if err != nil {
 				return nil, err
 			}
 		}
+		// Make the actual HTTP request using the shared backend transport.
 		response, err := g.transport.RoundTrip(request)
 		status := 0
 		if err != nil {
@@ -175,10 +179,12 @@ func (g *Gateway) roundTripAttempts(out *http.Request, r *route, incoming *url.U
 		} else {
 			status = response.StatusCode
 		}
+		// Return to gateway.go when no more attempts are allowed or needed.
 		if attempt+1 == attempts || out.Context().Err() != nil || !c.includes(status) {
 			return response, err
 		}
 		if response != nil {
+			// Close the discarded response before making another attempt.
 			response.Body.Close()
 		}
 	}

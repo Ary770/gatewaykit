@@ -1,6 +1,5 @@
-// Central request flow: match a route, enforce its policies, and forward a separate
-// HTTP request to a backend. Start at ServeHTTP, then follow forward; policy state
-// lives in route-owned helpers and network I/O uses the shared transport.
+// Follow a request through ServeHTTP, forward, and forwardPreparedRequest.
+// roundTripAttempts in retry.go sends it to the backend; the response returns here.
 
 package main
 
@@ -37,33 +36,39 @@ type Gateway struct {
 	now            func() time.Time
 }
 
-// ServeHTTP is the entry point Go calls for each client request. Liveness bypasses
-// backend policies; other requests pass path/method, authentication, and quota checks
-// before forwarding. A rejected check returns without contacting a backend.
+// ServeHTTP receives each client request and checks it before contacting a backend.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Set a default time limit while we find the route.
 	setClientDeadlines(w, g.defaultTimeout)
+	// Answer the gateway's health request without contacting a backend.
 	if req.Method == http.MethodGet && req.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "healthy", "uptime_seconds": int64(g.now().Sub(g.started).Seconds())})
 		return
 	}
+	// Reject paths the gateway and backend could interpret differently.
 	if ambiguousPath(req.URL) {
 		writeError(w, http.StatusBadRequest, "ambiguous_path")
 		return
 	}
+	// Find the most specific route that accepts this path and HTTP method.
 	r, allowed := g.match(req.URL.Path, req.Method)
 	if r == nil {
 		writeRouteRejection(w, allowed)
 		return
 	}
+	// Use this route's time limit for the rest of the request.
 	deadline := setClientDeadlines(w, r.timeout)
+	// Check the API key if this route requires one.
 	if !authorized(req, r.config.Auth) {
 		w.Header().Set("WWW-Authenticate", `ApiKey realm="gatewaykit"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	// Check the request limit; an allowed request counts once, even with retries.
 	if !g.allowRateLimitedRequest(w, req, r.limiter) {
 		return
 	}
+	// Route checks passed; prepare and send a separate request to the backend.
 	g.forward(w, req, r, deadline)
 }
 
@@ -101,8 +106,8 @@ func writeRouteRejection(w http.ResponseWriter, allowedMethods []string) {
 	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 }
 
-// allowRateLimitedRequest charges one quota slot or translates the limiter decision
-// into 429/503 plus Retry-After. Internal retry attempts do not pass through this check.
+// allowRateLimitedRequest counts an allowed request or returns 429/503 with Retry-After.
+// Retries do not pass through this check, so they do not count as new client requests.
 func (g *Gateway) allowRateLimitedRequest(w http.ResponseWriter, req *http.Request, limiter *rateLimiter) bool {
 	if limiter == nil {
 		return true
@@ -149,14 +154,18 @@ func (g *Gateway) match(path, method string) (*route, []string) {
 // forward gives preparation, attempts, and response handling one shared deadline.
 // The outgoing request is cloned so forwarding changes do not mutate the client request.
 func (g *Gateway) forward(w http.ResponseWriter, req *http.Request, r *route, deadline time.Time) {
+	// Stop backend work when the time limit expires or the client disconnects.
 	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	defer cancel()
+	// Copy the request so backend-specific changes leave the original unchanged.
 	out := cloneUpstreamRequest(req, ctx)
 	values := transformValues{requestTime: g.now().UTC().Format(time.RFC3339Nano), route: r.config.Path}
+	// Apply request changes once and save the body if it needs to be sent again.
 	attempts, ready := g.prepareUpstreamRequest(w, out, r, values, deadline)
 	if !ready {
 		return
 	}
+	// Continue to backend selection, sending, and response handling.
 	g.forwardPreparedRequest(w, req, out, r, values, attempts, deadline)
 }
 
@@ -217,6 +226,7 @@ func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Reques
 // Keep breaker accounting around the complete exchange, including streaming.
 // Client upload failures and canceled requests must not count as backend failures.
 func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.Request, r *route, values transformValues, attempts int, deadline time.Time) {
+	// Choose a backend that is currently marked healthy.
 	target := r.balancer.next()
 	if target == nil {
 		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream")
@@ -227,6 +237,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		upload = &observedRequestBody{ReadCloser: out.Body}
 		out.Body = upload
 	}
+	// Ask the circuit breaker whether this route can contact a backend now.
 	permit, retryAfter := r.breaker.admit(g.now())
 	if permit == nil {
 		seconds := max(int64(1), int64((retryAfter-1)/time.Second)+1)
@@ -234,6 +245,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "service_unavailable", "retry_after": seconds})
 		return
 	}
+	// Record one circuit-breaker result after response handling finishes.
 	outcome := breakerNeutral
 	defer func() {
 		if req.Context().Err() != nil || upload != nil && upload.failed.Load() {
@@ -241,6 +253,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		}
 		permit.finish(outcome, g.now())
 	}()
+	// Send through retry.go; get the final backend response or a sending error.
 	response, err := g.roundTripAttempts(out, r, req.URL, target, attempts, r.config.Retry)
 	if err != nil {
 		if errors.Is(err, errNoHealthyBackends) {
@@ -270,6 +283,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 	body := &observedUpstreamBody{ReadCloser: response.Body}
 	response.Body = body
 	removeHopHeaders(response.Header)
+	// Apply configured response changes before sending the response to the client.
 	if err := g.transformResponse(response, req, r, values); err != nil {
 		if body.failed || response.StatusCode >= 500 {
 			outcome = breakerFailure
@@ -283,6 +297,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		return
 	}
 	removeHopHeaders(response.Header)
+	// Return the final headers and status, then copy the response body to the client.
 	for key, values := range response.Header {
 		w.Header()[key] = append([]string(nil), values...)
 	}
