@@ -198,6 +198,7 @@ func cloneUpstreamRequest(req *http.Request, ctx context.Context) *http.Request 
 // prepareUpstreamRequest applies configured request changes once.
 // Save the body if retries need it. Stop here if preparation fails.
 func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Request, r *route, values transformValues, deadline time.Time) (int, bool) {
+	// FEATURE ADD-ON: Request transformation - apply configured header and JSON changes.
 	if status, err := g.transformRequest(out, r, values); err != nil {
 		if !time.Now().Before(deadline) || errors.Is(out.Context().Err(), context.DeadlineExceeded) {
 			status = http.StatusGatewayTimeout
@@ -206,6 +207,7 @@ func (g *Gateway) prepareUpstreamRequest(w http.ResponseWriter, out *http.Reques
 		writeError(w, status, "request_transform_failed")
 		return 0, false
 	}
+	// FEATURE ADD-ON: Retries - save the body when retries are allowed.
 	attempts, err := prepareRetry(out, r.config.Retry)
 	if err != nil {
 		status, message := http.StatusBadRequest, "request_body_read_failed"
@@ -236,7 +238,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		upload = &observedRequestBody{ReadCloser: out.Body}
 		out.Body = upload
 	}
-	// Ask the circuit breaker whether this route can contact a backend now.
+	// FEATURE ADD-ON: Circuit breaker - check whether this route can send now.
 	permit, retryAfter := r.breaker.admit(g.now())
 	if permit == nil {
 		seconds := max(int64(1), int64((retryAfter-1)/time.Second)+1)
@@ -244,7 +246,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "service_unavailable", "retry_after": seconds})
 		return
 	}
-	// Record one circuit-breaker result after response handling finishes.
+	// FEATURE ADD-ON: Circuit breaker - record one result after response handling finishes.
 	outcome := breakerNeutral
 	defer func() {
 		if req.Context().Err() != nil || upload != nil && upload.failed.Load() {
@@ -252,7 +254,7 @@ func (g *Gateway) forwardPreparedRequest(w http.ResponseWriter, req, out *http.R
 		}
 		permit.finish(outcome, g.now())
 	}()
-	// Send through retry.go; get the final backend response or a sending error.
+	// FEATURE ADD-ON: Retries and backoff - send once, then retry allowed failures if configured.
 	response, err := g.roundTripAttempts(out, r, req.URL, target, attempts, r.config.Retry)
 	if err != nil {
 		outcome = writeUpstreamError(w, out.Context(), r.config.Path, err)

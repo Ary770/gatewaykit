@@ -41,6 +41,7 @@ func (g *Gateway) relayUpstreamResponse(w http.ResponseWriter, req *http.Request
 	body := &observedUpstreamBody{ReadCloser: response.Body}
 	response.Body = body
 	removeHopHeaders(response.Header)
+	// FEATURE ADD-ON: Response transformation - apply configured header and JSON changes.
 	if err := g.transformResponse(response, req, r, values); err != nil {
 		outcome := breakerNeutral
 		if body.failed || response.StatusCode >= 500 {

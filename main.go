@@ -102,7 +102,7 @@ func serveGateway(ctx context.Context, gateway *Gateway, port int) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	// Start backend health checks and stop them when this function finishes.
+	// FEATURE ADD-ON: Active health checks - start backend checks and stop them on shutdown.
 	stopHealth := gateway.startHealthChecks(ctx)
 	defer stopHealth()
 	slog.Info("gateway listening", "address", listener.Addr().String(), "routes", len(gateway.routes))
