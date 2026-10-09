@@ -28,6 +28,76 @@ func TestConfigDefaultsAndAlternateValues(t *testing.T) {
 	}
 }
 
+func TestConfigValidationErrors(t *testing.T) {
+	const durationError = "must be a positive duration (for example 500ms, 5s, or 1m)"
+	for _, tc := range []struct {
+		name, input, want string
+	}{
+		{"gateway timeout", strings.Replace(minimalConfig, "port: 8080", "global_timeout: invalid", 1), "gateway.global_timeout: " + durationError},
+		{"gateway limit", strings.Replace(minimalConfig, "port: 8080", "global_rate_limit: {requests: 0}", 1), "gateway.global_rate_limit: requests must be positive"},
+		{"path", strings.Replace(minimalConfig, "/different", "relative", 1), "routes[0].path must be an absolute URL path without query or fragment"},
+		{"ambiguous path", strings.Replace(minimalConfig, "/different", "/a/../b", 1), "routes[0].path contains ambiguous separators or dot segments"},
+		{"empty methods", strings.Replace(minimalConfig, "[GET, POST]", "[]", 1), "routes[0].methods must not be empty"},
+		{"method token", strings.Replace(minimalConfig, "[GET, POST]", "['G ET']", 1), "routes[0].methods must contain uppercase HTTP method tokens"},
+		{"duplicate method", strings.Replace(minimalConfig, "[GET, POST]", "[GET, GET]", 1), "duplicate route/method /different GET"},
+		{"upstream timeout before limit", minimalConfig + "      timeout: invalid\n    rate_limit: {requests: 0}\n", "routes[0].upstream.timeout: " + durationError},
+		{"limit before destination", strings.Replace(minimalConfig, "http://localhost:3001", "invalid", 1) + "    rate_limit: {requests: 0}\n", "routes[0].rate_limit: requests must be positive"},
+		{"missing upstream", strings.Replace(minimalConfig, "url: http://localhost:3001", "url: ''", 1), "routes[0].upstream requires exactly one of url or targets"},
+		{"destination", strings.Replace(minimalConfig, "http://localhost:3001", "file:///tmp/backend", 1), "routes[0].upstream.url: must be an http(s) URL without credentials or fragment"},
+		{"balance", minimalConfig + "      balance: random\n", "routes[0].upstream.balance is unsupported"},
+		{"target", strings.Replace(minimalConfig, "url: http://localhost:3001", "targets: [{url: invalid}]", 1), "routes[0].upstream.targets[0]: must be an http(s) URL without credentials or fragment"},
+		{"weight", strings.Replace(minimalConfig, "url: http://localhost:3001", "targets: [{url: 'http://localhost:1', weight: 0}]\n      balance: weighted_round_robin", 1), "routes[0].upstream.targets[0].weight must be between 1 and 1000000"},
+		{"auth", minimalConfig + "    auth: {type: jwt, header: X-Key, keys: [abc]}\n", "routes[0].auth requires type api_key, a valid header, and nonempty keys"},
+		{"blank key", minimalConfig + "    auth: {type: api_key, header: X-Key, keys: [' ']}\n", "routes[0].auth.keys must not contain empty values"},
+		{"health", minimalConfig + "    health_check: {path: /healthz, interval: invalid}\n", "routes[0].health_check: interval: " + durationError},
+		{"transform", minimalConfig + "    request_transform: {headers: {add: {Connection: close}}}\n", `routes[0].transform: invalid, duplicate or protected header "Connection"`},
+		{"breaker", minimalConfig + "    circuit_breaker: {threshold: 0}\n", "routes[0].circuit_breaker: threshold must be between 1 and 1000000"},
+		{"retry", minimalConfig + "    retry: {attempts: 0}\n", "routes[0].retry: attempts must be between 1 and 100 (including the first)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, warnings, err := decodeConfig(strings.NewReader(tc.input))
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+			if len(warnings) != 0 {
+				t.Fatalf("unexpected warnings: %v", warnings)
+			}
+		})
+	}
+}
+
+func TestConfigNormalizedRouteMethods(t *testing.T) {
+	input := `gateway:
+  global_timeout: 7s
+routes:
+  - path: /shared/
+    methods: [GET]
+    upstream: {url: 'http://localhost:1'}
+  - path: /shared
+    methods: [POST]
+    upstream: {url: 'http://localhost:2', timeout: 2s}
+  - path: /
+    methods: [GET]
+    upstream: {url: 'http://localhost:3'}
+`
+	c, _, err := decodeConfig(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Gateway.Port != 8080 || c.Routes[0].Path != "/shared" || c.Routes[2].Path != "/" {
+		t.Fatalf("unexpected normalized configuration: %+v", c)
+	}
+	for i, want := range []string{"7s", "2s", "7s"} {
+		if c.Routes[i].Upstream.Timeout != want || c.Routes[i].Upstream.Balance != "round_robin" {
+			t.Fatalf("route %d: %+v", i, c.Routes[i].Upstream)
+		}
+	}
+	_, _, err = decodeConfig(strings.NewReader(strings.Replace(input, "methods: [POST]", "methods: [GET]", 1)))
+	if err == nil || err.Error() != "duplicate route/method /shared GET" {
+		t.Fatalf("expected normalized route conflict, got %v", err)
+	}
+}
+
 func TestConfigInvalid(t *testing.T) {
 	cases := map[string]string{
 		"malformed":           "gateway: [",

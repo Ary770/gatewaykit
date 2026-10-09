@@ -37,30 +37,6 @@ type Gateway struct {
 	now            func() time.Time
 }
 
-// newGateway prepares shared route state once and sorts routes by specificity.
-// It creates policy objects but starts no background workers or network requests.
-func newGateway(c Config, transport http.RoundTripper) *Gateway {
-	defaultTimeout, _ := duration(c.Gateway.GlobalTimeout)
-	g := &Gateway{transport: transport, started: time.Now(), now: time.Now, defaultTimeout: defaultTimeout}
-	for _, rc := range c.Routes {
-		timeout, _ := duration(rc.Upstream.Timeout)
-		r := &route{config: rc, timeout: timeout}
-		r.balancer = newBalancer(rc.Upstream)
-		r.breaker = newCircuitBreaker(rc.CircuitBreaker)
-		if r.breaker != nil {
-			r.breaker.route = rc.Path
-		}
-		limit := rc.RateLimit
-		if limit == nil {
-			limit = c.Gateway.GlobalRateLimit
-		}
-		r.limiter = newRateLimiter(limit)
-		g.routes = append(g.routes, r)
-	}
-	sort.SliceStable(g.routes, func(i, j int) bool { return len(g.routes[i].config.Path) > len(g.routes[j].config.Path) })
-	return g
-}
-
 // ServeHTTP is the entry point Go calls for each client request. Liveness bypasses
 // backend policies; other requests pass path/method, authentication, and quota checks
 // before forwarding. A rejected check returns without contacting a backend.
@@ -89,6 +65,30 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	g.forward(w, req, r, deadline)
+}
+
+// newGateway prepares shared route state once and sorts routes by specificity.
+// It creates policy objects but starts no background workers or network requests.
+func newGateway(c Config, transport http.RoundTripper) *Gateway {
+	defaultTimeout, _ := duration(c.Gateway.GlobalTimeout)
+	g := &Gateway{transport: transport, started: time.Now(), now: time.Now, defaultTimeout: defaultTimeout}
+	for _, rc := range c.Routes {
+		timeout, _ := duration(rc.Upstream.Timeout)
+		r := &route{config: rc, timeout: timeout}
+		r.balancer = newBalancer(rc.Upstream)
+		r.breaker = newCircuitBreaker(rc.CircuitBreaker)
+		if r.breaker != nil {
+			r.breaker.route = rc.Path
+		}
+		limit := rc.RateLimit
+		if limit == nil {
+			limit = c.Gateway.GlobalRateLimit
+		}
+		r.limiter = newRateLimiter(limit)
+		g.routes = append(g.routes, r)
+	}
+	sort.SliceStable(g.routes, func(i, j int) bool { return len(g.routes[i].config.Path) > len(g.routes[j].config.Path) })
+	return g
 }
 
 // writeRouteRejection distinguishes an unknown path (404) from a disallowed method (405).

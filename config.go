@@ -119,108 +119,156 @@ func decodeConfig(r io.Reader) (Config, []string, error) {
 	return c, warnings, err
 }
 
-// validate fills in defaults and checks each route. Two routes cannot use
-// the same path and method. These checks happen before requests arrive.
+// validate coordinates startup checks. The shared registry detects path/method
+// conflicts across routes after their paths have been normalized.
 func (c *Config) validate() ([]string, error) {
-	if c.Gateway.Port == 0 {
-		c.Gateway.Port = 8080
-	}
-	if c.Gateway.Port < 1 || c.Gateway.Port > 65535 {
-		return nil, fmt.Errorf("gateway.port must be between 1 and 65535")
-	}
-	if c.Gateway.GlobalTimeout == "" {
-		c.Gateway.GlobalTimeout = "30s"
-	}
-	if _, err := duration(c.Gateway.GlobalTimeout); err != nil {
-		return nil, fmt.Errorf("gateway.global_timeout: %w", err)
-	}
-	if err := validateLimit(c.Gateway.GlobalRateLimit); err != nil {
-		return nil, fmt.Errorf("gateway.global_rate_limit: %w", err)
+	if err := c.Gateway.validate(); err != nil {
+		return nil, err
 	}
 	seen := map[string]bool{}
 	for i := range c.Routes {
-		r := &c.Routes[i]
 		label := fmt.Sprintf("routes[%d]", i)
-		if !strings.HasPrefix(r.Path, "/") || strings.ContainsAny(r.Path, "?#\r\n") {
-			return nil, fmt.Errorf("%s.path must be an absolute URL path without query or fragment", label)
+		if err := c.Routes[i].validate(label, c.Gateway.GlobalTimeout, seen); err != nil {
+			return nil, err
 		}
-		if ambiguousPath(&url.URL{Path: r.Path}) {
-			return nil, fmt.Errorf("%s.path contains ambiguous separators or dot segments", label)
-		}
-		r.Path = strings.TrimRight(r.Path, "/")
-		if r.Path == "" {
-			r.Path = "/"
-		}
-		if len(r.Methods) == 0 {
-			return nil, fmt.Errorf("%s.methods must not be empty", label)
-		}
-		for _, method := range r.Methods {
-			if !validToken(method) || method != strings.ToUpper(method) {
-				return nil, fmt.Errorf("%s.methods must contain uppercase HTTP method tokens", label)
-			}
-			key := r.Path + " " + method
-			if seen[key] {
-				return nil, fmt.Errorf("duplicate route/method %s", key)
-			}
-			seen[key] = true
-		}
-		if r.Upstream.Timeout == "" {
-			r.Upstream.Timeout = c.Gateway.GlobalTimeout
-		}
-		if _, err := duration(r.Upstream.Timeout); err != nil {
-			return nil, fmt.Errorf("%s.upstream.timeout: %w", label, err)
-		}
-		if err := validateLimit(r.RateLimit); err != nil {
-			return nil, fmt.Errorf("%s.rate_limit: %w", label, err)
-		}
-		u := &r.Upstream
-		if (u.URL == "") == (len(u.Targets) == 0) {
-			return nil, fmt.Errorf("%s.upstream requires exactly one of url or targets", label)
-		}
-		if u.URL != "" {
-			if err := validateURL(u.URL); err != nil {
-				return nil, fmt.Errorf("%s.upstream.url: %w", label, err)
-			}
-		}
-		if u.Balance == "" {
-			u.Balance = "round_robin"
-		}
-		if u.Balance != "round_robin" && u.Balance != "weighted_round_robin" {
-			return nil, fmt.Errorf("%s.upstream.balance is unsupported", label)
-		}
-		for j, target := range u.Targets {
-			if err := validateURL(target.URL); err != nil {
-				return nil, fmt.Errorf("%s.upstream.targets[%d]: %w", label, j, err)
-			}
-			if u.Balance == "weighted_round_robin" && (target.Weight <= 0 || target.Weight > 1000000) {
-				return nil, fmt.Errorf("%s.upstream.targets[%d].weight must be between 1 and 1000000", label, j)
-			}
-		}
-		if err := validateHealthCheck(r.HealthCheck); err != nil {
-			return nil, fmt.Errorf("%s.health_check: %w", label, err)
-		}
-		if r.Auth != nil {
-			if r.Auth.Type != "api_key" || !validToken(r.Auth.Header) || len(r.Auth.Keys) == 0 {
-				return nil, fmt.Errorf("%s.auth requires type api_key, a valid header, and nonempty keys", label)
-			}
-			for _, key := range r.Auth.Keys {
-				if strings.TrimSpace(key) == "" {
-					return nil, fmt.Errorf("%s.auth.keys must not contain empty values", label)
-				}
-			}
-		}
-		if err := validateTransforms(*r); err != nil {
-			return nil, fmt.Errorf("%s.transform: %w", label, err)
-		}
-		if err := validateCircuitBreaker(r.CircuitBreaker); err != nil {
-			return nil, fmt.Errorf("%s.circuit_breaker: %w", label, err)
-		}
-		if err := validateRetry(r.Retry); err != nil {
-			return nil, fmt.Errorf("%s.retry: %w", label, err)
-		}
-
 	}
 	return nil, nil
+}
+
+// validate resolves gateway-wide defaults and checks the default route policies.
+func (g *GatewayConfig) validate() error {
+	if g.Port == 0 {
+		g.Port = 8080
+	}
+	if g.Port < 1 || g.Port > 65535 {
+		return fmt.Errorf("gateway.port must be between 1 and 65535")
+	}
+	if g.GlobalTimeout == "" {
+		g.GlobalTimeout = "30s"
+	}
+	if _, err := duration(g.GlobalTimeout); err != nil {
+		return fmt.Errorf("gateway.global_timeout: %w", err)
+	}
+	if err := validateLimit(g.GlobalRateLimit); err != nil {
+		return fmt.Errorf("gateway.global_rate_limit: %w", err)
+	}
+	return nil
+}
+
+// validate checks one route in order, keeping field-specific checks in their helpers.
+// label identifies this route in startup errors; seen belongs to the whole configuration.
+func (r *RouteConfig) validate(label, defaultTimeout string, seen map[string]bool) error {
+	if err := r.validateMatch(label, seen); err != nil {
+		return err
+	}
+	if err := r.Upstream.validateTimeout(label, defaultTimeout); err != nil {
+		return err
+	}
+	if err := validateLimit(r.RateLimit); err != nil {
+		return fmt.Errorf("%s.rate_limit: %w", label, err)
+	}
+	if err := r.Upstream.validateDestinations(label); err != nil {
+		return err
+	}
+	if err := validateHealthCheck(r.HealthCheck); err != nil {
+		return fmt.Errorf("%s.health_check: %w", label, err)
+	}
+	if err := validateAuth(r.Auth, label); err != nil {
+		return err
+	}
+	if err := validateTransforms(*r); err != nil {
+		return fmt.Errorf("%s.transform: %w", label, err)
+	}
+	if err := validateCircuitBreaker(r.CircuitBreaker); err != nil {
+		return fmt.Errorf("%s.circuit_breaker: %w", label, err)
+	}
+	if err := validateRetry(r.Retry); err != nil {
+		return fmt.Errorf("%s.retry: %w", label, err)
+	}
+	return nil
+}
+
+// validateMatch normalizes the path and registers its allowed methods.
+// Routes may share a normalized path only when their methods do not overlap.
+func (r *RouteConfig) validateMatch(label string, seen map[string]bool) error {
+	if !strings.HasPrefix(r.Path, "/") || strings.ContainsAny(r.Path, "?#\r\n") {
+		return fmt.Errorf("%s.path must be an absolute URL path without query or fragment", label)
+	}
+	if ambiguousPath(&url.URL{Path: r.Path}) {
+		return fmt.Errorf("%s.path contains ambiguous separators or dot segments", label)
+	}
+	r.Path = strings.TrimRight(r.Path, "/")
+	if r.Path == "" {
+		r.Path = "/"
+	}
+	if len(r.Methods) == 0 {
+		return fmt.Errorf("%s.methods must not be empty", label)
+	}
+	for _, method := range r.Methods {
+		if !validToken(method) || method != strings.ToUpper(method) {
+			return fmt.Errorf("%s.methods must contain uppercase HTTP method tokens", label)
+		}
+		key := r.Path + " " + method
+		if seen[key] {
+			return fmt.Errorf("duplicate route/method %s", key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+// validateTimeout inherits the gateway timeout when this upstream has no override.
+func (u *UpstreamConfig) validateTimeout(label, defaultTimeout string) error {
+	if u.Timeout == "" {
+		u.Timeout = defaultTimeout
+	}
+	if _, err := duration(u.Timeout); err != nil {
+		return fmt.Errorf("%s.upstream.timeout: %w", label, err)
+	}
+	return nil
+}
+
+// validateDestinations checks backend URLs and resolves the balancing default.
+func (u *UpstreamConfig) validateDestinations(label string) error {
+	if (u.URL == "") == (len(u.Targets) == 0) {
+		return fmt.Errorf("%s.upstream requires exactly one of url or targets", label)
+	}
+	if u.URL != "" {
+		if err := validateURL(u.URL); err != nil {
+			return fmt.Errorf("%s.upstream.url: %w", label, err)
+		}
+	}
+	if u.Balance == "" {
+		u.Balance = "round_robin"
+	}
+	if u.Balance != "round_robin" && u.Balance != "weighted_round_robin" {
+		return fmt.Errorf("%s.upstream.balance is unsupported", label)
+	}
+	for j, target := range u.Targets {
+		if err := validateURL(target.URL); err != nil {
+			return fmt.Errorf("%s.upstream.targets[%d]: %w", label, j, err)
+		}
+		if u.Balance == "weighted_round_robin" && (target.Weight <= 0 || target.Weight > 1000000) {
+			return fmt.Errorf("%s.upstream.targets[%d].weight must be between 1 and 1000000", label, j)
+		}
+	}
+	return nil
+}
+
+// validateAuth checks optional API-key settings without exposing key values in errors.
+func validateAuth(c *AuthConfig, label string) error {
+	if c == nil {
+		return nil
+	}
+	if c.Type != "api_key" || !validToken(c.Header) || len(c.Keys) == 0 {
+		return fmt.Errorf("%s.auth requires type api_key, a valid header, and nonempty keys", label)
+	}
+	for _, key := range c.Keys {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("%s.auth.keys must not contain empty values", label)
+		}
+	}
+	return nil
 }
 
 // validateLimit checks the request limit, time period, counting method, and client grouping.
