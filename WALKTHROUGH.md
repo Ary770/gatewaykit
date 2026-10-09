@@ -1,136 +1,278 @@
-# GatewayKit walkthrough
+# GatewayKit project review walkthrough
 
-Use this as speaking notes. Start with the overview, show the demo, then follow one request through the code. The commands and expected responses are in [DEMO.md](DEMO.md).
+Use these speaking notes to explain the Go app you submitted. Follow one request, `GET /api/users/123`, from its YAML settings to the backend and back. Show one function at a time and explain what it does, why it is here, and how it is tested.
 
-## How I'd introduce it
+Aim for about 20 minutes, leaving time for questions.
 
-> I built a small API gateway that reads its routes and settings from YAML. It checks the request, chooses a backend, and forwards it.
->
-> I started with routing and basic proxying. Then I added timeouts, API-key checks, rate limits, and weighted load balancing. I focused on making those work correctly, including when requests arrive together or a backend fails.
->
-> I preserved that core baseline, then added bounded transformations, active health checks, circuit breakers, and safe retries in separate reviewed commits. The README explains their safety boundaries.
+**Presentation order:** settings → startup → request checks → backend request → response → additional features → tests → live examples.
 
-## What I'd show in 30 minutes
+## 1 Explain the purpose
 
-| Time | What to cover |
+**Time: 1 minute.** Show the [README](/Users/arybaldioceda/dev/gatewaykit/README.md), briefly.
+
+> GatewayKit sits between clients and backend services. It receives a request, checks the rules for that route, sends the request to the backend, and returns the backend's response. YAML controls those rules.
+
+> I started with startup, the health endpoint, and basic forwarding. Once those worked, I added the additional features and tested how they interact.
+
+## 2 Explain the settings and one route
+
+**Time: 2 minutes.** Open [gateway.yaml](/Users/arybaldioceda/dev/gatewaykit/gateway.yaml:3).
+
+| Setting | Simple meaning |
 |---|---|
-| First 3 minutes | What it does and what I prioritized |
-| Next 7 minutes | The live demo |
-| Next 10 minutes | Follow a request through the code |
-| Last 10 minutes | Tests, review fixes, trade-offs, and questions |
+| `port: 8080` | Accept requests on port 8080. |
+| `global_timeout: "30s"` | Use a default request time limit of 30 seconds. |
+| `requests: 100`, `window: "60s"` | Default to 100 accepted requests during a 60-second period. |
+| `strategy: "fixed_window"` | Count requests during a fixed period, then reset. Our period starts with the first accepted request. |
+| `per: "ip"` | Keep a separate counter for each client IP address. |
 
-## Start with the demo
+> Each route has its own counters. The global rate limit supplies a default for routes without their own limit; it isn't one shared counter across all routes.
 
-```sh
+Then show [`/api/users`](/Users/arybaldioceda/dev/gatewaykit/gateway.yaml:12):
+
+- `path` and `methods` select which requests this route accepts.
+- `upstream.url` names the backend, on port 3001.
+- `strip_prefix: false` keeps the full request path.
+- This route overrides the default limit with 30 requests per IP in a sliding 60-second window. A sliding window counts requests in the most recent 60 seconds.
+
+> For GET /api/users/123, the gateway selects this route and forwards the request to the service on port 3001. Changing the backend address doesn't require changing gateway code.
+
+Supporting pointers: [configuration structures](/Users/arybaldioceda/dev/gatewaykit/config.go:17) turn YAML into Go fields; [`newGateway`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:77) prepares each route's settings and counters.
+
+**Transition:** Now I'll show how those settings become a running server.
+
+## 3 Show startup
+
+**Time: 2 minutes.** Start at [`run`](/Users/arybaldioceda/dev/gatewaykit/main.go:31).
+
+| Step | Code pointer | Main point |
+|---|---|---|
+| Find the configuration file | [`resolveConfigPath`](/Users/arybaldioceda/dev/gatewaykit/main.go:57) | Select the command-line path or `GATEWAY_CONFIG`. |
+| Read and validate settings | [`loadConfig`](/Users/arybaldioceda/dev/gatewaykit/config.go:97), then [`validate`](/Users/arybaldioceda/dev/gatewaykit/config.go:125) | Read YAML, fill in defaults, and reject invalid settings before accepting requests. |
+| Prepare the HTTP sender and gateway | [`newUpstreamTransport`](/Users/arybaldioceda/dev/gatewaykit/main.go:80), then [`newGateway`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:77) | Prepare backend communication and the routes. |
+| Start the server | [`serveGateway`](/Users/arybaldioceda/dev/gatewaykit/main.go:92) | Open the configured port and accept requests. |
+
+> The transport sends HTTP requests to backends. We reuse it so requests can reuse existing network connections.
+
+Point to `Handler: gateway` in `serveGateway`:
+
+> This connects the HTTP server to our request-handling code. For every incoming request, Go calls ServeHTTP.
+
+Keep the focus on `run`. Open the helpers when explaining a particular step or answering a question.
+
+## 4 Follow the request checks
+
+**Time: 3 minutes.** Open [`ServeHTTP`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:40).
+
+> This is the main request flow. Each check either allows the request to continue or returns an error.
+
+Follow the code in order:
+
+1. Answer the gateway's `/health` request.
+2. Reject paths the gateway and backend could interpret differently.
+3. Find the matching route and check its HTTP method.
+4. Apply the route's time limit.
+5. Check the API key, if required.
+6. Check the request limit.
+7. Forward the request.
+
+> If one of these checks fails, the backend never receives the request.
+
+| Supporting function | What to explain |
+|---|---|
+| [`match`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:132) | Check the longest matching route. `/api/users` matches `/api/users/123`, but not `/api/users-extra`. |
+| [`authorized`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:367) | Check the configured API key. |
+| [`allowRateLimitedRequest`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:111) | Allow the request or return a limit error. |
+| [`rateLimiter.allow`](/Users/arybaldioceda/dev/gatewaykit/ratelimit.go:49) | Check and update the count together under a lock. |
+
+Then open [`forward`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:157):
+
+> This prepares a separate backend request. It keeps the original request unchanged and uses one time limit for preparation, sending, and response handling.
+
+A **deadline** is the time by which the work must finish. A **context** carries that deadline and the signal to stop work if the request is canceled.
+
+## 5 Explain the backend request and response
+
+**Time: 3 minutes.** Open [`forwardPreparedRequest`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:229).
+
+| Step | Explanation |
+|---|---|
+| Choose a backend | Select a backend currently marked healthy. Return 503 if none is available. |
+| Track upload errors | Detect failed client uploads so they do not count as backend failures. |
+| Check the circuit breaker | Block new backend requests after repeated backend failures. |
+| Send the request | `roundTripAttempts` sends the request and handles configured retries. |
+| Handle the response | Pass sending errors or backend responses to the functions in `response.go`. |
+
+Point to the deferred call to `permit.finish`:
+
+> Defer means this runs when the function finishes. We record the circuit-breaker result after response handling, because receiving headers doesn't prove that the backend finished sending its body.
+
+Then open [response.go](/Users/arybaldioceda/dev/gatewaykit/response.go):
+
+| Function | One job |
+|---|---|
+| [`writeUpstreamError`](/Users/arybaldioceda/dev/gatewaykit/response.go:16) | Return an error when sending fails: 503 for no healthy backend, 504 for a timeout, or 502 otherwise. |
+| [`relayUpstreamResponse`](/Users/arybaldioceda/dev/gatewaykit/response.go:35) | Apply response changes and determine the backend result. |
+| [`copyUpstreamResponse`](/Users/arybaldioceda/dev/gatewaykit/response.go:72) | Send the final headers, status, and body to the client. |
+
+> The main function coordinates the work. The helpers handle individual details. A broken backend response can count against the breaker; a failed client upload or client write should not.
+
+**Important edge case:** once response headers have been sent, the gateway cannot replace the status with an error. If the body fails partway through, it closes the connection so the response is not treated as complete.
+
+## 6 Explain the additional features
+
+**Time: 2 minutes.** Search for `FEATURE ADD-ON:` to find the calls in the main flow.
+
+| Feature | Simple explanation | Call site and implementation |
+|---|---|---|
+| Retries and backoff | Retry allowed failures, with a delay and the original time limit. | [Prepare retries](/Users/arybaldioceda/dev/gatewaykit/gateway.go:210); [send with retries](/Users/arybaldioceda/dev/gatewaykit/gateway.go:257); [`roundTripAttempts`](/Users/arybaldioceda/dev/gatewaykit/retry.go:142). |
+| Request transformations | Change configured headers or JSON fields before forwarding. | [Call site](/Users/arybaldioceda/dev/gatewaykit/gateway.go:201); [`transformRequest`](/Users/arybaldioceda/dev/gatewaykit/transform.go:368). |
+| Response transformations | Change headers or wrap the backend's JSON response. | [Call site](/Users/arybaldioceda/dev/gatewaykit/response.go:44); [`transformResponse`](/Users/arybaldioceda/dev/gatewaykit/transform.go:410). |
+| Active health checks | Periodically check backends and stop selecting ones that repeatedly fail. | [Start checks](/Users/arybaldioceda/dev/gatewaykit/main.go:105); [`monitorBackend`](/Users/arybaldioceda/dev/gatewaykit/health.go:62). |
+| Circuit breaker | Block requests after repeated backend failures, then allow a trial request after waiting. | [Call site](/Users/arybaldioceda/dev/gatewaykit/gateway.go:241); [`admit`](/Users/arybaldioceda/dev/gatewaykit/circuitbreaker.go:62); [`finish`](/Users/arybaldioceda/dev/gatewaykit/circuitbreaker.go:85). |
+
+> Health checks make separate background requests. The circuit breaker learns from failures while handling client requests.
+
+The users route follows the core path. Other routes enable the additional features. Open one feature implementation in detail if asked.
+
+## 7 Show tests and explain AI use
+
+**Time: 3 minutes.** Open [`TestProxyPreservesRequestAndResponse`](/Users/arybaldioceda/dev/gatewaykit/gateway_test.go:32).
+
+> This test starts a local HTTP backend and checks what actually crosses the gateway: the request going in and the response coming back.
+
+Show the setup and assertions. Keep these tests ready for questions:
+
+- [`TestRoutingAndStripping`](/Users/arybaldioceda/dev/gatewaykit/gateway_test.go:78): route selection and prefix removal.
+- [`TestUpstreamFailureAndTimeout`](/Users/arybaldioceda/dev/gatewaykit/gateway_test.go:133): backend failures and timeouts.
+- [`TestAuthenticationAndRateLimitPipeline`](/Users/arybaldioceda/dev/gatewaykit/gateway_test.go:197): authentication and request limits.
+- [`TestDefaultRateLimitAndRouteOverride`](/Users/arybaldioceda/dev/gatewaykit/gateway_test.go:237): default limits and route overrides.
+- [Response regression tests](/Users/arybaldioceda/dev/gatewaykit/response_test.go): backend failures, interrupted bodies, client write errors, and response cleanup.
+
+Explain AI use:
+
+> I used Codex for planning, implementation, and tests. I set the priorities and reviewed the resulting changes. Additional features were developed in isolated worktrees and integrated with shared checks. Review findings became regression tests.
+
+Mention specific model names only if you can verify them.
+
+## 8 Run the app
+
+**Time: 3 minutes.** Run these commands from `/Users/arybaldioceda/dev/gatewaykit`. Stop existing processes using ports 8080 and 3001–3006 before starting another copy.
+
+First terminal:
+
+```bash
+go run ./cmd/mock
+```
+
+Second terminal:
+
+```bash
+go run . -config gateway.yaml
+```
+
+Use a third terminal for the requests.
+
+### Check the gateway
+
+```bash
+curl -i http://localhost:8080/health
+```
+
+Expected: **200**.
+
+> This checks the gateway itself. It doesn't guarantee that every backend is healthy.
+
+### Follow the users request
+
+```bash
+curl -i 'http://localhost:8080/api/users/123?active=true'
+```
+
+Expected: **200**, backend port **3001**, path `/api/users/123`, and query `active=true`.
+
+> The demo backend echoes what it received. Its responses are demo data, but the gateway communicates with it through real HTTP requests.
+
+Code pointer: [`mockHandler`](/Users/arybaldioceda/dev/gatewaykit/cmd/mock/main.go:77).
+
+### Show a rejected method
+
+```bash
+curl -i -X DELETE http://localhost:8080/api/users/123
+```
+
+Expected: **405**. Code pointer: [`writeRouteRejection`](/Users/arybaldioceda/dev/gatewaykit/gateway.go:100).
+
+### Show authentication
+
+```bash
+curl -i http://localhost:8080/api/internal
+```
+
+Expected: **401**.
+
+```bash
+curl -i http://localhost:8080/api/internal \
+  -H 'X-API-Key: sk_live_abc123'
+```
+
+Expected: **200**, using the configuration's example key.
+
+### Optional transformation example
+
+```bash
+curl -i http://localhost:8080/api/legacy/profile \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug: presentation' \
+  -d '{"userId":123,"userName":"Ary"}'
+```
+
+Point out the backend path `/profile`, changed JSON fields, removed `X-Debug` header, added headers, and response wrapper.
+
+### Optional retry example
+
+```bash
+curl -s -o /dev/null \
+  -w 'Status: %{http_code}, elapsed: %{time_total}s\n' \
+  'http://localhost:8080/api/orders?status=503'
+```
+
+Expected: **503 after roughly three seconds of retry delays**, plus processing time. The backend intentionally keeps failing.
+
+### Optional request limit example
+
+Run this last:
+
+```bash
+for i in {1..31}; do
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    http://localhost:8080/api/users
+done
+```
+
+Expected: **200 responses followed by 429 responses**. Earlier users requests also count toward the allowance. After enough time has passed, old requests stop counting.
+
+### Browser demo
+
+You can finish with the browser UI. Stop the manually started gateway and mocks first, then run:
+
+```bash
 python3 demo/run.py
 ```
 
-Open http://127.0.0.1:8080/demo/index.html and click **Run the main demo**. Then use the four **Additional features** buttons individually. The circuit-breaker example takes about seven seconds.
+Open [the browser demo](http://127.0.0.1:8080/demo/index.html). The launcher builds the application and starts the demo services. It requires Go and Python 3.
 
-> This starts the real gateway, the demo page server, and the mock backends. Each button sends real HTTP requests through the gateway and displays the response. The demo uses different routes and settings from the supplied config. Press Ctrl+C in the launcher terminal to stop it.
+> This uses a separate demo configuration, with routes chosen to make each behavior easy to exercise.
 
-For automated terminal demonstrations, use `./scripts/demo.sh` or `./scripts/demo-features.sh`; see DEMO.md for their ports and prerequisites.
+See [DEMO.md](/Users/arybaldioceda/dev/gatewaykit/DEMO.md) for the browser and terminal scenarios.
 
-The main things to point out:
+## Close with one tradeoff
 
-- The backend receives the request body and query string. Prefix stripping changes `/echo/hello` to `/hello`.
-- An unknown route returns `404`. A method that isn't allowed returns `405`.
-- A missing API key returns `401`. The configured key lets the request through.
-- The limited route accepts three requests and rejects the fourth with `429` and `Retry-After`.
-- With weights of 3 and 1, eight requests split six to one backend and two to the other.
-- A slow backend returns `504`. An unreachable backend returns `502`.
-- `/health` tells us the gateway is running. It still returns `200` when backends are down.
+> The components are separated so each part can be understood and tested independently. Request counters and circuit-breaker state currently live in memory. Multiple gateway instances would need a coordinated approach if limits must apply across the whole deployment.
 
-Use [DEMO.md](DEMO.md) to run these individually. Start a fresh gateway before demonstrating the rate limit so earlier requests don't affect the count.
+For each function, answer: **What does it do? Why is it here? How do we know it works?** Show one function at a time, then return to the main request flow.
 
-## Follow one request through the code
-
-### 1. Start the app: [main.go](main.go)
-
-> This is the startup and shutdown code. It gets the config path, validates the file, creates the HTTP transport, and starts listening.
->
-> I reuse one transport so requests can reuse backend connections. When the app stops, it gives active requests up to five seconds to finish.
-
-A transport sends the HTTP request. Our code still decides where to send it and how to forward the response.
-
-### 2. Read the settings: [config.go](config.go)
-
-> I validate the config before accepting traffic. Bad URLs, invalid durations, conflicting routes, or missing auth settings fail at startup with an error.
->
-> Defaults are resolved once. Each request uses the settings we've already loaded.
-
-Point out that the timeout override is under `upstream.timeout`. All feature settings are typed and validated at startup.
-
-### 3. Handle the request: [gateway.go](gateway.go)
-
-Start at `ServeHTTP`.
-
-> This shows the order of the checks. Health comes first. For other requests, I find the route, check the method and API key, check the rate limit, prepare transformations and replay, choose an eligible backend, check the circuit, and forward the request.
->
-> If a check fails, we return there. The request never reaches the backend.
-
-Then show `match` and `forward`.
-
-`forward` copies the client request, applies configured changes, and prepares its body for retries when needed. All of this uses one time limit. `forwardPreparedRequest` chooses a backend, checks the circuit breaker, and sends the request through `roundTripAttempts` in `retry.go`.
-
-Then open [response.go](response.go). `writeUpstreamError` handles sending errors. `relayUpstreamResponse` applies response changes and calls `copyUpstreamResponse` to send the headers, status, and body. The main function records the circuit-breaker result after response handling finishes. A broken backend body counts as a failure; a failed client upload or client write does not.
-
-> The most specific matching route wins. `/api/users` matches `/api/users/123`, but it doesn't match `/api/users-extra`.
->
-> The forwarding code builds the backend URL, copies the request, and streams the response back. Ordinary routes stream. JSON transformations and retryable uploads buffer at most 1 MiB.
-
-Two details worth explaining if asked:
-
-- Some headers only apply to one connection, such as `Connection` and `Keep-Alive`. We remove those before forwarding. We also remove any extra headers named by `Connection`.
-- The backend request and the client socket use a shared deadline. That covers a slow backend, an unfinished upload, and a client that stops reading. Writes get one extra second to allow a timeout response. If a response has already started, a later failure closes it because we can't change the status anymore.
-
-### 4. Count requests safely: [ratelimit.go](ratelimit.go)
-
-> Each route owns its request counts. A lock keeps the quota check and count update together, so simultaneous requests can't all claim the last available slot. We release the lock before contacting the backend.
->
-> Fixed windows count requests from the start of a window. Sliding windows keep the accepted request times and remove the ones that are too old.
-
-Start at `allow`: it keeps the whole decision under one lock, makes the evaluation time monotonic, cleans expired buckets, finds the client bucket, and calls the selected window algorithm. `allowFixedWindow` and `allowSlidingWindow` each own their quota rule. The returned `rateLimitDecision` names the outcome and retry delay; `allowRateLimitedRequest` in the gateway translates it into an HTTP response.
-
-`per: ip` uses the client's connection address. `per: global` shares one count across all clients of that route. The gateway-level policy supplies the default for each route; a route override replaces it.
-
-> I don't trust a client-supplied IP header. Otherwise someone could change the header on every request to avoid the limit.
-
-### 5. Choose a backend: [balancer.go](balancer.go)
-
-> Equal weights take turns. Different weights change the share of requests each backend receives.
->
-> The algorithm adds each backend's weight to its score, picks the highest score, and subtracts the total weight from the winner. That's how it keeps the configured ratio without creating a list of repeated backend entries.
-
-The lock only protects those scores. Requests to different backends can still run at the same time.
-
-### 6. Follow-up features
-
-- `transform.go` maps JSON and applies the final response envelope, with input/output bounds and protected headers.
-- `health.go` starts probes after the server binds, excludes unhealthy targets, restores recovered targets, and joins workers on shutdown.
-- `circuitbreaker.go` keeps route state under a lock. One probe tests recovery; late results cannot overwrite newer state.
-- `retry.go` prepares replay bytes once, closes discarded responses, and keeps attempts/backoff inside one deadline.
-
-Run `./scripts/demo-features.sh` for these features. The combined tests use all four on the same route and prove that retries count once for quota and breaker state.
-
-## Explain the testing and review
-
-> The tests start their own HTTP servers, so they don't depend on manually running the mocks. They check paths, headers, bodies, errors, authentication, limits, and balancing.
->
-> One concurrency test sends 50 requests against a limit of ten and checks that exactly ten get through. The limiter boundary tests use controlled times, so they don't need to wait for a window to expire.
-
-The review found issues worth talking about:
-
-| Issue | What I changed |
-|---|---|
-| An encoded path could select a less protected route | Match the decoded path and reject ambiguous path forms before choosing a policy |
-| Concurrent requests could record timestamps out of order | Keep the limiter's effective time from moving backward while holding the lock |
-| A stalled upload could continue past the backend timeout | Add client-socket deadlines as well as the backend deadline |
-| Two timeout signals could race and produce `502` instead of `504` | Use one shared deadline to classify the failure consistently |
-
-> I added regression tests for those cases. The final timeout check passed 100 repetitions locally and another 100 in the independent review. I also tested the extracted submission ZIP.
-
-The full results are in [REVIEW.md](REVIEW.md).
+## Reference notes for questions
 
 ## Decisions I'd be ready to explain
 
