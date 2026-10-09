@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +17,80 @@ import (
 	"testing"
 	"time"
 )
+
+func TestResolveConfigPath(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		env, want string
+		wantErr   string
+	}{
+		{name: "environment", env: "env.yaml", want: "env.yaml"},
+		{name: "positional overrides environment", args: []string{"arg.yaml"}, env: "env.yaml", want: "arg.yaml"},
+		{name: "flag overrides environment", args: []string{"-config", "flag.yaml"}, env: "env.yaml", want: "flag.yaml"},
+		{name: "empty flag falls back to environment", args: []string{"-config", ""}, env: "env.yaml", want: "env.yaml"},
+		{name: "required", wantErr: "configuration required"},
+		{name: "multiple paths", args: []string{"a", "b"}, wantErr: "provide one"},
+		{name: "conflicting paths", args: []string{"-config", "a", "b"}, wantErr: "provide one"},
+		{name: "unknown flag", args: []string{"-unknown"}, wantErr: "flag provided but not defined"},
+		{name: "missing flag value", args: []string{"-config"}, wantErr: "flag needs an argument"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, err := resolveConfigPath(tc.args, tc.env)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || path != "" {
+					t.Fatalf("got path %q, error %v; want empty path and %q", path, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || path != tc.want {
+				t.Fatalf("got path %q, error %v; want %q", path, err, tc.want)
+			}
+		})
+	}
+	if _, err := resolveConfigPath([]string{"-help"}, ""); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help must preserve flag.ErrHelp, got %v", err)
+	}
+}
+
+func TestNewUpstreamTransportPreservesCompressedResponse(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write([]byte(`{"message":"hello"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Automatic compression negotiation would change what the backend receives.
+		w.Header().Set("X-Received-Accept-Encoding", r.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed.Bytes())
+	}))
+	defer upstream.Close()
+	transport := newUpstreamTransport()
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Get("X-Received-Accept-Encoding") != "" {
+		t.Fatal("transport added compression negotiation")
+	}
+	if response.Header.Get("Content-Encoding") != "gzip" || !bytes.Equal(body, compressed.Bytes()) {
+		t.Fatal("transport changed the compressed response representation")
+	}
+}
 
 func TestConfigPathSelection(t *testing.T) {
 	for _, tc := range []struct {
